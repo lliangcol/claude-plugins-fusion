@@ -50,9 +50,9 @@ describe('recommendNext', () => {
     expect(next.command).toBe('plan-lite');
   });
 
-  it('uses workflow context for Java backend plans', () => {
+  it('uses workflow context for backend plans', () => {
     const state = applyGuidanceUpdate(createDefaultGuidanceState(), 'senior-explore', 'explore', 1);
-    const next = recommendNext(state, { workflowTemplate: 'Java backend' });
+    const next = recommendNext(state, { workflowTemplate: 'workflow-d' });
     expect(next.stage).toBe('plan');
     expect(next.command).toBe('backend-plan');
   });

@@ -1,5 +1,5 @@
 ﻿
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { manifest } from './data/manifest';
 import {
   Attachment,
@@ -21,13 +21,15 @@ import { evaluateConstraints, evaluateContext, evaluateIntent, QualityFeedback }
 import { buildCommandStageMap, recommendNext, stageFlow } from './utils/guidance';
 
 type Tab = 'scenes' | 'commands' | 'generator' | 'workflows' | 'workflow-run' | 'history';
+type SaveFilePicker = (options?: SaveFilePickerOptions) => Promise<FileSystemFileHandle>;
+type DirectoryPicker = () => Promise<FileSystemDirectoryHandle>;
 
 const stageLabels: Record<string, string> = {
-  explore: 'Explore',
-  plan: 'Plan',
-  review: 'Review',
-  implement: 'Implement',
-  finalize: 'Finalize',
+  explore: '探索',
+  plan: '规划',
+  review: '评审',
+  implement: '实施',
+  finalize: '交付',
 };
 
 const icons = {
@@ -138,7 +140,7 @@ const NextStepCard = ({
     <div className="next-step-body">{recommendation.reason}</div>
     <div className="next-step-actions">
       <button className="btn secondary" onClick={onUse}>
-        使用 {recommendation.command}
+        使用命令 <code>{recommendation.command}</code>
       </button>
       <button className="btn ghost" onClick={onBrowse}>
         查看其它命令
@@ -162,7 +164,7 @@ const GuardrailBanner = ({
         <Icon name="steps" />
       </div>
       <div className="guardrail-content">
-        <div className="guardrail-title">建议先完成 Plan / Review</div>
+        <div className="guardrail-title">建议先完成规划与评审</div>
         <div className="guardrail-body">这样可以降低返工风险并提升输出质量。</div>
       </div>
       <div className="guardrail-actions">
@@ -199,6 +201,11 @@ const getMissingVariables = (text: string) => {
 
 const getDefaultAttachmentTarget = (cmd: CommandDefinition) =>
   cmd.fields.find((f) => f.id === 'CONTEXT')?.id ?? cmd.fields[0]?.id ?? '';
+
+type FieldOption = string | { value: string; label: string };
+
+const normalizeOption = (option: FieldOption) =>
+  typeof option === 'string' ? { value: option, label: option } : option;
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('scenes');
@@ -237,6 +244,7 @@ export default function App() {
     previewOverride: string | null;
   } | null>(null);
   const draftRestoreRef = useRef(false);
+  const draftAttachmentTargetRef = useRef<string | null>(null);
   const feedbackTimerRef = useRef<number | null>(null);
 
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
@@ -247,16 +255,22 @@ export default function App() {
   const [workflowStepStatus, setWorkflowStepStatus] = useState<Record<string, 'pending' | 'done' | 'skipped'>>({});
   const [workflowPreviewOverrides, setWorkflowPreviewOverrides] = useState<Record<string, string>>({});
   const [workflowBindingsApplied, setWorkflowBindingsApplied] = useState<Record<string, boolean>>({});
+  const [workflowStepOutputs, setWorkflowStepOutputs] = useState<Record<string, string>>({});
   const [workflowVarKey, setWorkflowVarKey] = useState('');
   const [workflowVarValue, setWorkflowVarValue] = useState('');
   const [workflowAttachmentTarget, setWorkflowAttachmentTarget] = useState('');
   const [workflowAttachmentMode, setWorkflowAttachmentMode] = useState<'path' | 'snippet' | 'full'>('snippet');
+  const [commandStageFilter, setCommandStageFilter] = useState<'all' | StageKey>('all');
+  const [commandRigorFilter, setCommandRigorFilter] = useState<'all' | 'weak' | 'medium' | 'strong'>('all');
+  const [commandDomainFilter, setCommandDomainFilter] = useState<'all' | 'general' | 'specialized'>('all');
+  const [showSpecializedCommands, setShowSpecializedCommands] = useState(false);
 
   const selectedCommand = useMemo(
     () => (selectedCommandId ? manifest.commands.find((c) => c.id === selectedCommandId) ?? null : null),
     [selectedCommandId],
   );
   const commandStageMap = useMemo(() => buildCommandStageMap(manifest.commands), []);
+  const commandLookup = useMemo(() => new Map(manifest.commands.map((command) => [command.id, command])), []);
   const canAccessGenerator = Boolean(selectedCommandId);
   const stageLabelMap = useMemo(() => stageLabels, []);
   const workflowSuggestion = useMemo(() => {
@@ -265,7 +279,7 @@ export default function App() {
       workflow.steps.some((step) => step.commandId === selectedCommand.id),
     );
     if (!match) return null;
-    return `This command is often used as part of ${match.title}.`;
+    return `该命令常用于工作流：${match.title}。`;
   }, [selectedCommand]);
 
   useEffect(() => {
@@ -274,9 +288,10 @@ export default function App() {
     setFormDraft(null);
     if (draftRestoreRef.current) {
       draftRestoreRef.current = false;
-      if (!attachmentTarget) {
+      if (!draftAttachmentTargetRef.current) {
         setAttachmentTarget(getDefaultAttachmentTarget(selectedCommand));
       }
+      draftAttachmentTargetRef.current = null;
       return;
     }
     setVariables({});
@@ -284,7 +299,7 @@ export default function App() {
     setPreviewOverride(null);
     setAttachmentMode('snippet');
     setAttachmentTarget(getDefaultAttachmentTarget(selectedCommand));
-  }, [selectedCommandId, selectedCommand]);
+  }, [selectedCommandId, selectedCommand, formDraft]);
 
   const handleFieldChange = (fieldId: string, value: string | boolean) => {
     setFormState((prev) => ({ ...prev, [fieldId]: value }));
@@ -353,16 +368,22 @@ export default function App() {
     setGuidanceState(nextGuidance);
     setNextRecommendation(recommendNext(nextGuidance, guidanceContext));
     setShowNextCard(true);
-    showFeedback('Generated and saved to History (local storage).');
+    showFeedback('已生成并保存到历史记录。');
   };
+
+  const MAX_ATTACHMENT_BYTES = 200 * 1024;
 
   const handleFileUpload = async (files: FileList | null) => {
     if (!files) return;
     const next: Attachment[] = [];
     for (const file of Array.from(files)) {
-      const text = await file.text();
-      const snippet = text.slice(0, 2000);
-      next.push({ name: file.name, content: snippet });
+      try {
+        const text = await file.slice(0, MAX_ATTACHMENT_BYTES).text();
+        const snippet = text.slice(0, 2000);
+        next.push({ name: file.name, content: snippet });
+      } catch {
+        showFeedback(`附件读取失败：${file.name}`);
+      }
     }
     setAttachments((prev) => [...prev, ...next]);
   };
@@ -373,7 +394,7 @@ export default function App() {
     if (!fieldDef) return;
     if (fieldDef.type === 'list') {
       const existing = Array.isArray(formState[fieldId]) ? (formState[fieldId] as string[]) : [];
-      const items = attachments.map((a) => `File: ${a.name}`);
+      const items = attachments.map((a) => `文件：${a.name}`);
       setFormState((prev) => ({ ...prev, [fieldId]: [...existing, ...items] }));
       return;
     }
@@ -381,9 +402,9 @@ export default function App() {
     const existing = typeof field === 'string' ? field : '';
     const joined = attachments
       .map((a) => {
-        if (mode === 'path') return `- File: ${a.name}`;
-        if (mode === 'snippet') return `- File: ${a.name}\n  ---\n  ${a.content}\n  ---`;
-        return `- File: ${a.name}\n  ---\n  ${a.content}\n  ---`;
+        if (mode === 'path') return `- 文件：${a.name}`;
+        if (mode === 'snippet') return `- 文件：${a.name}\n  ---\n  ${a.content}\n  ---`;
+        return `- 文件：${a.name}\n  ---\n  ${a.content}\n  ---`;
       })
       .join('\n');
     handleFieldChange(fieldId, `${existing}\n${joined}`.trim());
@@ -427,38 +448,41 @@ export default function App() {
         payload.content,
         payload.filename,
         payload.type,
-        `Exported ${payload.filename} to your default downloads folder.`,
+        '已导出到下载目录。',
       );
       return;
     }
     if (mode === 'save') {
-      const showSaveFilePicker = (window as unknown as { showSaveFilePicker?: (options?: unknown) => Promise<any> })
-        .showSaveFilePicker;
+      const showSaveFilePicker = (window as unknown as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker;
       if (!showSaveFilePicker) {
         exportBlob(payload.content, payload.filename, payload.type);
         return;
       }
-      const handle = await showSaveFilePicker({
-        suggestedName: payload.filename,
-        types: [{ description: payload.type, accept: { [payload.type]: [`.${kind}`] } }],
-      });
-      const writable = await handle.createWritable();
-      await writable.write(payload.content);
-      await writable.close();
-      showFeedback(`Exported ${payload.filename} to the selected save location.`);
+      try {
+        const handle = await showSaveFilePicker({
+          suggestedName: payload.filename,
+          types: [{ description: payload.type, accept: { [payload.type]: [`.${kind}`] } }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(payload.content);
+        await writable.close();
+        showFeedback('已保存到指定位置。');
+      } catch {
+        exportBlob(payload.content, payload.filename, payload.type, '保存失败，已改为下载。');
+      }
       return;
     }
     if (mode === 'share' && navigator.share) {
       try {
         await navigator.share({ title: selectedCommand.displayName, text: payload.content });
-        showFeedback('Shared via the system share sheet.');
+        showFeedback('已通过系统分享。');
         return;
       } catch {
         exportBlob(
           payload.content,
           payload.filename,
           payload.type,
-          `Exported ${payload.filename} to your default downloads folder.`,
+          '已导出到下载目录。',
         );
         return;
       }
@@ -467,7 +491,7 @@ export default function App() {
       payload.content,
       payload.filename,
       payload.type,
-      `Exported ${payload.filename} to your default downloads folder.`,
+      '已导出到下载目录。',
     );
   };
 
@@ -514,45 +538,170 @@ export default function App() {
   const getSceneRecommendation = (scenario: ScenarioDefinition) => {
     if (scenario.recommendWorkflowId) {
       return {
-        label: 'Workflow',
-        note: 'This scenario involves multiple steps, so a workflow keeps the sequence aligned.',
+        type: 'workflow' as const,
+        label: '工作流',
+        cta: '开始引导',
+        note: '该场景包含多步骤，建议用工作流保持节奏一致。',
       };
     }
     return {
-      label: 'Single Command',
-      note: 'This scenario produces a single artifact, so one command is enough.',
+      type: 'command' as const,
+      label: '单命令',
+      cta: '直接开始',
+      note: '该场景只需单条命令即可完成。',
     };
   };
 
   const sceneCards = (scenarios: ScenarioDefinition[]) =>
     scenarios.map((s) => {
       const recommendation = getSceneRecommendation(s);
+      const hasWorkflow = Boolean(s.recommendWorkflowId);
+      const hasCommand = Boolean(s.recommendCommandId);
+      const primaryCta = recommendation.cta;
+      const categoryTags = Array.from(
+        new Set(
+          s.category
+            .split(/[,/|·]/)
+            .map((tag) => tag.trim())
+            .filter(Boolean),
+        ),
+      ).slice(0, 2);
+      const secondaryLabel =
+        recommendation.type === 'workflow'
+          ? hasCommand
+            ? '转为单命令'
+            : '查看命令'
+          : hasWorkflow
+            ? '进入工作流'
+            : '查看工作流';
       return (
         <div
           key={s.id}
           className={`card scene-card ${s.recommendCommandId || s.recommendWorkflowId ? 'recommended' : ''}`.trim()}
         >
-          <div className="card-title">{s.title}</div>
-          <div className="card-sub">{s.category}</div>
-          <div className="scene-recommend">
-            <div className="scene-recommend-label">
-              Recommended Path <span className="badge">{recommendation.label}</span>
+          <div className="scene-card-header">
+            <div className="card-title">{s.title}</div>
+            <div className="scene-tags">
+              {categoryTags.map((tag) => (
+                <span key={tag} className="scene-tag">
+                  {tag}
+                </span>
+              ))}
             </div>
-            <div className="scene-recommend-note">{recommendation.note}</div>
+            <div className="scene-problem-label">问题类型</div>
+            <div className="scene-problem">{s.category}</div>
           </div>
-          {s.recommendCommandId && (
-            <button className="btn secondary" onClick={() => setCommandAndSwitch(s.recommendCommandId)}>
-              用 {s.recommendCommandId}
+          <div className={`scene-path scene-path-${recommendation.type}`}>
+            <div className="scene-path-label">
+              <Icon name={recommendation.type === 'workflow' ? 'workflows' : 'commands'} />
+              推荐路径
+            </div>
+            <div className="scene-path-value">{recommendation.label}</div>
+            <div className="scene-path-why">{recommendation.note}</div>
+          </div>
+          <div className="card-actions">
+            {recommendation.type === 'workflow' && s.recommendWorkflowId ? (
+              <button className="btn primary" onClick={() => startWorkflow(s.recommendWorkflowId)}>
+                {primaryCta}
+              </button>
+            ) : s.recommendCommandId ? (
+              <button className="btn primary" onClick={() => setCommandAndSwitch(s.recommendCommandId)}>
+                {primaryCta}
+              </button>
+            ) : (
+              <button className="btn primary" onClick={() => setTab('commands')}>
+                {primaryCta}
+              </button>
+            )}
+            <button
+              className="btn ghost"
+              onClick={() => {
+                if (recommendation.type === 'workflow') {
+                  if (s.recommendCommandId) {
+                    setCommandAndSwitch(s.recommendCommandId);
+                    return;
+                  }
+                  setTab('commands');
+                  return;
+                }
+                if (s.recommendWorkflowId) {
+                  startWorkflow(s.recommendWorkflowId);
+                  return;
+                }
+                setTab('workflows');
+              }}
+            >
+              {secondaryLabel}
             </button>
-          )}
-          {s.recommendWorkflowId && (
-            <button className="btn secondary" onClick={() => startWorkflow(s.recommendWorkflowId)}>
-              启动工作流
-            </button>
-          )}
+          </div>
         </div>
       );
     });
+
+  const getCommandPrerequisites = (command: CommandDefinition) => {
+    const requiredFields = command.fields.filter((field) => field.required);
+    const prereqLabels = requiredFields.map((field) => field.label);
+    const hasStrongPrereq =
+      command.constraintLevel === 'strong' ||
+      requiredFields.length >= 2 ||
+      requiredFields.some((field) => /APPROV|PLAN|REVIEW|SPEC|DESIGN/i.test(`${field.id} ${field.label}`));
+    const hasArtifactHint = requiredFields.some((field) => /APPROV|PLAN|REVIEW|SPEC|DESIGN/i.test(`${field.id} ${field.label}`));
+    return {
+      requiredFields,
+      prereqLabels,
+      hasStrongPrereq,
+      hasArtifactHint,
+    };
+  };
+
+const getCommandDisplayTitle = (command: CommandDefinition) => {
+    return command.displayName;
+  };
+
+  const renderCommandCard = (command: CommandDefinition) => {
+    const prereq = getCommandPrerequisites(command);
+    return (
+      <div key={command.id} className="card">
+        <div className="card-title">{getCommandDisplayTitle(command)}</div>
+        <div className="command-id">
+          命令标识 <code>{command.id}</code>
+        </div>
+        <div className="command-meta">
+          <span className="badge">{stageLabels[command.stage]}</span>
+          <span
+            className={`badge ${
+              command.constraintLevel === 'strong'
+                ? 'rigor-strict'
+                : command.constraintLevel === 'medium'
+                  ? 'rigor-standard'
+                  : 'rigor-lite'
+            }`}
+          >
+            {constraintLabel[command.constraintLevel]}
+          </span>
+          {command.constraintLevel === 'strong' && <span className="badge severity-high">高影响</span>}
+        </div>
+        <div className="card-sub">{command.description}</div>
+        {prereq.requiredFields.length > 0 && prereq.hasStrongPrereq ? (
+          <div className="command-warning" title={prereq.prereqLabels.join(' + ')}>
+            使用前需提供：{prereq.prereqLabels.join(' + ')}
+            {prereq.hasArtifactHint && (
+              <button className="link-inline" type="button" onClick={() => setTab('history')}>
+                查看产出
+              </button>
+            )}
+          </div>
+        ) : prereq.requiredFields.length > 0 ? (
+          <div className="command-prereq">必填：{prereq.prereqLabels.join(' + ')}</div>
+        ) : null}
+        <div className="card-actions">
+          <button className="btn primary" onClick={() => setCommandAndSwitch(command.id)}>
+            进入生成器
+          </button>
+        </div>
+      </div>
+    );
+  };
 
   const sortedCommands = useMemo(
     () =>
@@ -565,14 +714,51 @@ export default function App() {
     [],
   );
 
-  const groupedCommands = useMemo(() => {
+  const isSpecializedCommand = (command: CommandDefinition) =>
+    /backend|frontend|ios|android|java|spring|database|db|infra|security|ml|data/i.test(
+      `${command.id} ${command.displayName} ${command.description}`,
+    );
+
+  const filteredCommands = useMemo(() => {
+    return sortedCommands.filter((command) => {
+      const stageOk = commandStageFilter === 'all' || command.stage === commandStageFilter;
+      const rigorOk = commandRigorFilter === 'all' || command.constraintLevel === commandRigorFilter;
+      return stageOk && rigorOk;
+    });
+  }, [sortedCommands, commandStageFilter, commandRigorFilter]);
+
+  const filteredGeneralCommands = useMemo(
+    () => filteredCommands.filter((command) => !isSpecializedCommand(command)),
+    [filteredCommands],
+  );
+  const filteredSpecializedCommands = useMemo(
+    () => filteredCommands.filter((command) => isSpecializedCommand(command)),
+    [filteredCommands],
+  );
+
+  const groupedGeneralCommands = useMemo(() => {
     const groups: Record<string, CommandDefinition[]> = {};
-    sortedCommands.forEach((c) => {
-      groups[c.stage] = groups[c.stage] || [];
-      groups[c.stage].push(c);
+    filteredGeneralCommands.forEach((command) => {
+      groups[command.stage] = groups[command.stage] || [];
+      groups[command.stage].push(command);
     });
     return groups;
-  }, [sortedCommands]);
+  }, [filteredGeneralCommands]);
+
+  const groupedSpecializedCommands = useMemo(() => {
+    const groups: Record<string, CommandDefinition[]> = {};
+    filteredSpecializedCommands.forEach((command) => {
+      groups[command.stage] = groups[command.stage] || [];
+      groups[command.stage].push(command);
+    });
+    return groups;
+  }, [filteredSpecializedCommands]);
+
+  useEffect(() => {
+    if (commandDomainFilter === 'specialized') {
+      setShowSpecializedCommands(true);
+    }
+  }, [commandDomainFilter]);
 
   const attachableFields = selectedCommand
     ? selectedCommand.fields.filter((f) => f.type !== 'select' && f.type !== 'boolean')
@@ -582,11 +768,14 @@ export default function App() {
     const draft = loadDraft();
     if (!draft) return;
     draftRestoreRef.current = true;
+    draftAttachmentTargetRef.current = draft.attachmentTarget ?? null;
     setFormDraft(draft.formState);
     setSelectedCommandId(draft.selectedCommandId);
     setVariables(draft.variables ?? {});
     setAttachments(draft.attachments ?? []);
-    setAttachmentTarget(draft.attachmentTarget ?? getDefaultAttachmentTarget(selectedCommand ?? manifest.commands[0]));
+    const draftCommand =
+      manifest.commands.find((command) => command.id === draft.selectedCommandId) ?? manifest.commands[0];
+    setAttachmentTarget(draft.attachmentTarget ?? getDefaultAttachmentTarget(draftCommand));
     setAttachmentMode(draft.attachmentMode ?? 'snippet');
     setPreviewOverride(draft.previewOverride ?? null);
     setDraftRestored(true);
@@ -639,7 +828,7 @@ export default function App() {
     [activeWorkflowId],
   );
   const guidanceContext = useMemo(
-    () => (activeWorkflow ? { workflowTemplate: activeWorkflow.title } : undefined),
+    () => (activeWorkflow ? { workflowTemplate: activeWorkflow.id } : undefined),
     [activeWorkflow],
   );
   const guardrailRecommendation = useMemo(() => recommendNext(guidanceState, guidanceContext), [guidanceState, guidanceContext]);
@@ -670,11 +859,11 @@ export default function App() {
   const generatorSections = useMemo(() => {
     if (!selectedCommand) return [];
     const sections = [
-      { key: 'intent', title: 'Intent', match: (f: FieldDefinition) => /INTENT/i.test(f.id) },
-      { key: 'context', title: 'Context', match: (f: FieldDefinition) => /CONTEXT/i.test(f.id) },
-      { key: 'constraints', title: 'Constraints', match: (f: FieldDefinition) => /CONSTRAINTS/i.test(f.id) },
-      { key: 'depth', title: 'Depth', match: (f: FieldDefinition) => f.id === 'DEPTH' },
-      { key: 'export', title: 'Export path', match: (f: FieldDefinition) => f.type === 'path' },
+      { key: 'intent', title: '意图', match: (f: FieldDefinition) => /INTENT/i.test(f.id) },
+      { key: 'context', title: '上下文', match: (f: FieldDefinition) => /CONTEXT/i.test(f.id) },
+      { key: 'constraints', title: '约束', match: (f: FieldDefinition) => /CONSTRAINTS/i.test(f.id) },
+      { key: 'depth', title: '深度', match: (f: FieldDefinition) => f.id === 'DEPTH' },
+      { key: 'export', title: '导出路径', match: (f: FieldDefinition) => f.type === 'path' },
     ];
     const used = new Set<string>();
     const resolved = sections
@@ -686,7 +875,7 @@ export default function App() {
       .filter((section) => section.fields.length > 0);
     const otherFields = selectedCommand.fields.filter((f) => !used.has(f.id));
     if (otherFields.length > 0) {
-      resolved.push({ key: 'details', title: 'Details', fields: otherFields });
+      resolved.push({ key: 'details', title: '其他信息', fields: otherFields });
     }
     return resolved;
   }, [selectedCommand]);
@@ -722,6 +911,38 @@ export default function App() {
   const workflowPreviewOverride = currentStep && currentStep.stepId in workflowPreviewOverrides ? workflowPreviewOverrides[currentStep.stepId] : null;
   const workflowPreviewText = workflowPreviewOverride ?? workflowComputedPreview;
   const workflowMissingVars = getMissingVariables(workflowComputedPreview);
+  const workflowSavedOutput = currentStep ? workflowStepOutputs[currentStep.stepId] ?? null : null;
+  const workflowHasSavedOutput = Boolean(workflowSavedOutput);
+  const workflowStepTotal = activeWorkflow?.steps.length ?? 0;
+  const workflowCurrentNumber = workflowStepIndex + 1;
+  const workflowCompletedCount = activeWorkflow
+    ? activeWorkflow.steps.filter((step) => workflowStepStatus[step.stepId] === 'done').length
+    : 0;
+  const workflowSkippedCount = activeWorkflow
+    ? activeWorkflow.steps.filter((step) => workflowStepStatus[step.stepId] === 'skipped').length
+    : 0;
+  const workflowRemainingCount = Math.max(workflowStepTotal - workflowCompletedCount - workflowSkippedCount, 0);
+  const workflowProgressPercent = workflowStepTotal > 0 ? Math.min((workflowCurrentNumber / workflowStepTotal) * 100, 100) : 0;
+  const workflowCurrentStatus = currentStep ? workflowStepStatus[currentStep.stepId] ?? 'pending' : 'pending';
+  const workflowNextStep =
+    activeWorkflow && workflowStepIndex < workflowStepTotal - 1 ? activeWorkflow.steps[workflowStepIndex + 1] : null;
+  const workflowNextCommand = workflowNextStep ? commandLookup.get(workflowNextStep.commandId) ?? null : null;
+  const workflowNextLabel = workflowNextCommand?.displayName ?? workflowNextStep?.commandId ?? '';
+  const workflowPrevStep = activeWorkflow && workflowStepIndex > 0 ? activeWorkflow.steps[workflowStepIndex - 1] : null;
+  const workflowPrevCommand = workflowPrevStep ? commandLookup.get(workflowPrevStep.commandId) ?? null : null;
+  const workflowPrevLabel = workflowPrevCommand?.displayName ?? workflowPrevStep?.commandId ?? '';
+  const workflowOptionalLabels = activeWorkflow
+    ? activeWorkflow.steps
+        .filter((step) => step.optional)
+        .map((step) => commandLookup.get(step.commandId)?.displayName ?? step.commandId)
+    : [];
+  const workflowStepFraming = (() => {
+    if (!workflowCommand || !currentStep) return '';
+    const optionalNote = currentStep.optional ? '该可选步骤' : '该步骤';
+    const prevNote = workflowPrevLabel ? '承接前序输出' : '用于奠定工作流基础';
+    const nextNote = workflowNextLabel ? '以便下一步继续使用' : '以便完成工作流收尾';
+    return `${optionalNote}用于产出当前阶段成果，${prevNote}，${nextNote}。`;
+  })();
   useEffect(() => {
     if (!currentStep || !workflowCommand) return;
     setWorkflowForms((prev) => {
@@ -730,16 +951,16 @@ export default function App() {
     });
     setWorkflowAttachmentTarget(getDefaultAttachmentTarget(workflowCommand));
     setWorkflowAttachmentMode('snippet');
-  }, [currentStep?.stepId, workflowCommand?.id]);
+  }, [currentStep, workflowCommand]);
 
-  const updateWorkflowForm = (updater: (current: FormState) => FormState) => {
+  const updateWorkflowForm = useCallback((updater: (current: FormState) => FormState) => {
     if (!currentStep || !workflowCommand) return;
     setWorkflowForms((prev) => {
       const current = prev[currentStep.stepId] ?? initForm(workflowCommand);
       const next = updater(current);
       return { ...prev, [currentStep.stepId]: next };
     });
-  };
+  }, [currentStep, workflowCommand]);
 
   const updateWorkflowField = (fieldId: string, value: string | boolean) => {
     updateWorkflowForm((current) => ({ ...current, [fieldId]: value }));
@@ -765,8 +986,12 @@ export default function App() {
     if (!files || !currentStep) return;
     const next: Attachment[] = [];
     for (const file of Array.from(files)) {
-      const text = await file.text();
-      next.push({ name: file.name, content: text.slice(0, 2000) });
+      try {
+        const text = await file.slice(0, MAX_ATTACHMENT_BYTES).text();
+        next.push({ name: file.name, content: text.slice(0, 2000) });
+      } catch {
+        showFeedback(`附件读取失败：${file.name}`);
+      }
     }
     setWorkflowAttachments((prev) => ({
       ...prev,
@@ -780,26 +1005,30 @@ export default function App() {
     if (!fieldDef) return;
     if (fieldDef.type === 'list') {
       const existing = Array.isArray(workflowFormState[fieldId]) ? (workflowFormState[fieldId] as string[]) : [];
-      const items = workflowAttachmentsList.map((a) => `File: ${a.name}`);
+      const items = workflowAttachmentsList.map((a) => `文件：${a.name}`);
       updateWorkflowForm((current) => ({ ...current, [fieldId]: [...existing, ...items] }));
       return;
     }
     const existing = typeof workflowFormState[fieldId] === 'string' ? (workflowFormState[fieldId] as string) : '';
     const joined = workflowAttachmentsList
       .map((a) => {
-        if (mode === 'path') return `- File: ${a.name}`;
-        if (mode === 'snippet') return `- File: ${a.name}\n  ---\n  ${a.content}\n  ---`;
-        return `- File: ${a.name}\n  ---\n  ${a.content}\n  ---`;
+        if (mode === 'path') return `- 文件：${a.name}`;
+        if (mode === 'snippet') return `- 文件：${a.name}\n  ---\n  ${a.content}\n  ---`;
+        return `- 文件：${a.name}\n  ---\n  ${a.content}\n  ---`;
       })
       .join('\n');
     updateWorkflowField(fieldId, `${existing}\n${joined}`.trim());
   };
 
-  const applyBindingsForStep = () => {
+  useEffect(() => {
     if (!currentStep || !workflowCommand) return;
-    if (!currentStep.autoBindings || currentStep.autoBindings.length === 0) return;
+    if (workflowBindingsApplied[currentStep.stepId]) return;
+    if (!currentStep.autoBindings || currentStep.autoBindings.length === 0) {
+      setWorkflowBindingsApplied((prev) => ({ ...prev, [currentStep.stepId]: true }));
+      return;
+    }
     updateWorkflowForm((current) => {
-      let next = { ...current };
+      const next = { ...current };
       let changed = false;
       currentStep.autoBindings.forEach((binding) => {
         const value = workflowVariables[binding.fromVar];
@@ -822,14 +1051,30 @@ export default function App() {
       });
       return changed ? next : current;
     });
+    setWorkflowBindingsApplied((prev) => ({ ...prev, [currentStep.stepId]: true }));
+  }, [currentStep, workflowCommand, workflowBindingsApplied, workflowVariables, updateWorkflowForm, activeWorkflowId]);
+
+  const moveToWorkflowStep = (index: number, notice?: string) => {
+    if (!activeWorkflow) return;
+    if (index < 0 || index >= activeWorkflow.steps.length) return;
+    setWorkflowStepIndex(index);
+    if (tab === 'workflow-run') {
+      showFeedback(notice ?? `已切换到步骤 ${index + 1}/${activeWorkflow.steps.length}。`);
+    }
   };
 
-  useEffect(() => {
-    if (!currentStep || !workflowCommand) return;
-    if (workflowBindingsApplied[currentStep.stepId]) return;
-    applyBindingsForStep();
-    setWorkflowBindingsApplied((prev) => ({ ...prev, [currentStep.stepId]: true }));
-  }, [currentStep?.stepId, workflowCommand?.id, activeWorkflowId]);
+  const scrollToWorkflowSection = (id: string) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+
+  const showWorkflowSavedOutput = () => {
+    if (!currentStep || !workflowSavedOutput) return;
+    setWorkflowPreviewOverrides((prev) => ({ ...prev, [currentStep.stepId]: workflowSavedOutput }));
+    showFeedback('已加载上次保存的输出。');
+    scrollToWorkflowSection('workflow-preview');
+  };
 
   const handleWorkflowGenerate = () => {
     if (!currentStep || !workflowCommand || !workflowFormState) return;
@@ -863,15 +1108,20 @@ export default function App() {
       });
       setWorkflowVariables(next);
     }
+    setWorkflowStepOutputs((prev) => ({ ...prev, [currentStep.stepId]: workflowPreviewText }));
     setWorkflowStepStatus((prev) => ({ ...prev, [currentStep.stepId]: 'done' }));
+    showFeedback('已生成并保存本步骤输出。');
   };
 
   const handleWorkflowSkip = () => {
     if (!currentStep) return;
     setWorkflowStepStatus((prev) => ({ ...prev, [currentStep.stepId]: 'skipped' }));
     if (activeWorkflow && workflowStepIndex < activeWorkflow.steps.length - 1) {
-      setWorkflowStepIndex((prev) => prev + 1);
+      const nextIndex = workflowStepIndex + 1;
+      moveToWorkflowStep(nextIndex, `已跳过步骤 ${workflowCurrentNumber}，进入步骤 ${nextIndex + 1}。`);
+      return;
     }
+    showFeedback(`已跳过步骤 ${workflowCurrentNumber}/${workflowStepTotal}。`);
   };
 
   const handleWorkflowReset = () => {
@@ -887,19 +1137,23 @@ export default function App() {
       return;
     }
     if (mode === 'save') {
-      const showSaveFilePicker = (window as unknown as { showSaveFilePicker?: (options?: unknown) => Promise<any> })
-        .showSaveFilePicker;
+      const showSaveFilePicker = (window as unknown as { showSaveFilePicker?: SaveFilePicker }).showSaveFilePicker;
       if (!showSaveFilePicker) {
         exportBlob(payload.content, payload.filename, payload.type);
         return;
       }
-      const handle = await showSaveFilePicker({
-        suggestedName: payload.filename,
-        types: [{ description: payload.type, accept: { [payload.type]: [`.${kind}`] } }],
-      });
-      const writable = await handle.createWritable();
-      await writable.write(payload.content);
-      await writable.close();
+      try {
+        const handle = await showSaveFilePicker({
+          suggestedName: payload.filename,
+          types: [{ description: payload.type, accept: { [payload.type]: [`.${kind}`] } }],
+        });
+        const writable = await handle.createWritable();
+        await writable.write(payload.content);
+        await writable.close();
+        showFeedback('已保存到指定位置。');
+      } catch {
+        exportBlob(payload.content, payload.filename, payload.type, '保存失败，已改为下载。');
+      }
       return;
     }
     if (mode === 'share' && navigator.share) {
@@ -929,7 +1183,7 @@ export default function App() {
   const supportsShare = Boolean(navigator.share);
 
   const pickDirectory = async (onPick: (value: string) => void) => {
-    const showDirectoryPicker = (window as unknown as { showDirectoryPicker?: () => Promise<any> }).showDirectoryPicker;
+    const showDirectoryPicker = (window as unknown as { showDirectoryPicker?: DirectoryPicker }).showDirectoryPicker;
     if (!showDirectoryPicker) return;
     const handle = await showDirectoryPicker();
     onPick(handle?.name ?? '');
@@ -963,7 +1217,7 @@ export default function App() {
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
-      showFeedback('Copied to clipboard.');
+      showFeedback('已复制到剪贴板。');
     } catch {
       const textarea = document.createElement('textarea');
       textarea.value = text;
@@ -973,81 +1227,108 @@ export default function App() {
       textarea.select();
       document.execCommand('copy');
       document.body.removeChild(textarea);
-      showFeedback('Copied to clipboard.');
+      showFeedback('已复制到剪贴板。');
     }
   };
 
-  const renderField = (f: FieldDefinition) => (
-    <div key={f.id} className="field">
-      <label className="field-label">
-        {f.label}
-        {f.required && <span className="required">*</span>}
-      </label>
-      {f.type === 'select' ? (
-        <select value={String(formState[f.id] ?? '')} onChange={(e) => handleFieldChange(f.id, e.target.value)} className="input">
-          {(f.options ?? []).map((o) => (
-            <option key={o} value={o}>
-              {o}
-            </option>
-          ))}
-        </select>
-      ) : f.type === 'boolean' ? (
-        <input type="checkbox" checked={Boolean(formState[f.id])} onChange={(e) => handleFieldChange(f.id, e.target.checked)} />
-      ) : f.type === 'path' ? (
-        <div className="input-row">
-          <input
-            className="input"
-            value={(formState[f.id] as string) ?? ''}
-            placeholder="选择或输入路径"
+  const renderField = (f: FieldDefinition, options?: { hideLabel?: boolean }) => {
+    const inputId = `field-${selectedCommandId}-${f.id}`;
+    const ariaLabel = options?.hideLabel ? f.label : undefined;
+    return (
+      <div key={f.id} className="field">
+        {!options?.hideLabel && (
+          <label className="field-label" htmlFor={inputId}>
+            {f.label}
+            {f.required && <span className="required">*</span>}
+          </label>
+        )}
+        {f.type === 'select' ? (
+          <select
+            id={inputId}
+            aria-label={ariaLabel}
+            value={String(formState[f.id] ?? '')}
             onChange={(e) => handleFieldChange(f.id, e.target.value)}
-          />
-          <button
-            className="btn secondary"
-            type="button"
-            disabled={!supportsDirectoryPicker}
-            onClick={() => pickDirectory((value) => handleFieldChange(f.id, value))}
+            className="input"
           >
-            <Icon name="folder" /> 选文件夹
-          </button>
-        </div>
-      ) : f.type === 'list' ? (
-        <>
-          <textarea
-            className="input"
-            rows={3}
-            placeholder="每行一项"
-            value={(formState[f.id] as string[] | undefined)?.join('\n') ?? ''}
-            onChange={(e) => handleListChange(f.id, e.target.value)}
+            {(f.options ?? []).map((option) => {
+              const normalized = normalizeOption(option);
+              return (
+                <option key={normalized.value} value={normalized.value}>
+                  {normalized.label}
+                </option>
+              );
+            })}
+          </select>
+        ) : f.type === 'boolean' ? (
+          <input
+            id={inputId}
+            aria-label={ariaLabel ?? f.label}
+            type="checkbox"
+            checked={Boolean(formState[f.id])}
+            onChange={(e) => handleFieldChange(f.id, e.target.checked)}
           />
-          <button className="btn danger" type="button" onClick={() => clearFieldValue(f.id, f.type)}>
-            <Icon name="trash" /> 清空多行内容
-          </button>
-        </>
-      ) : (
-        <>
-          <textarea
-            className="input"
-            rows={f.type === 'text' ? 2 : 4}
-            value={(formState[f.id] as string) ?? ''}
-            onChange={(e) => handleFieldChange(f.id, e.target.value)}
-          />
-          {f.type === 'multiline' && (
+        ) : f.type === 'path' ? (
+          <div className="input-row">
+            <input
+              id={inputId}
+              aria-label={ariaLabel}
+              className="input"
+              value={(formState[f.id] as string) ?? ''}
+              placeholder="选择或输入路径"
+              onChange={(e) => handleFieldChange(f.id, e.target.value)}
+            />
+            <button
+              className="btn secondary"
+              type="button"
+              disabled={!supportsDirectoryPicker}
+              onClick={() => pickDirectory((value) => handleFieldChange(f.id, value))}
+            >
+              <Icon name="folder" /> 选文件夹
+            </button>
+          </div>
+        ) : f.type === 'list' ? (
+          <>
+            <textarea
+              id={inputId}
+              aria-label={ariaLabel}
+              className="input"
+              rows={3}
+              placeholder="每行一项"
+              value={(formState[f.id] as string[] | undefined)?.join('\n') ?? ''}
+              onChange={(e) => handleListChange(f.id, e.target.value)}
+            />
             <button className="btn danger" type="button" onClick={() => clearFieldValue(f.id, f.type)}>
               <Icon name="trash" /> 清空多行内容
             </button>
-          )}
-        </>
-      )}
-      {f.help && <div className="muted small">{f.help}</div>}
-    </div>
-  );
+          </>
+        ) : (
+          <>
+            <textarea
+              id={inputId}
+              aria-label={ariaLabel}
+              className="input"
+              rows={f.type === 'text' ? 2 : 4}
+              value={(formState[f.id] as string) ?? ''}
+              onChange={(e) => handleFieldChange(f.id, e.target.value)}
+            />
+            {f.type === 'multiline' && (
+              <button className="btn danger" type="button" onClick={() => clearFieldValue(f.id, f.type)}>
+                <Icon name="trash" /> 清空多行内容
+              </button>
+            )}
+          </>
+        )}
+        {f.help && <div className="muted small">{f.help}</div>}
+      </div>
+    );
+  };
 
   const checklistItems = useMemo(() => {
     const items = [
-      { id: 'intent', label: 'Intent', sectionKey: 'intent' },
-      { id: 'context', label: 'Context', sectionKey: 'context' },
-      { id: 'constraints', label: 'Constraints', sectionKey: 'constraints' },
-      { id: 'paths', label: 'Paths', sectionKey: 'export' },
+      { id: 'intent', label: '意图', sectionKey: 'intent' },
+      { id: 'context', label: '上下文', sectionKey: 'context' },
+      { id: 'constraints', label: '约束', sectionKey: 'constraints' },
+      { id: 'paths', label: '路径', sectionKey: 'export' },
     ];
     if (!selectedCommand) {
       return items.map((item) => ({
@@ -1075,35 +1356,40 @@ export default function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <div className="title">命令生成器 Command Generator</div>
+        <div className="title">命令生成器</div>
         <div className="tabs">
-          <button className={tab === 'scenes' ? 'tab active' : 'tab'} onClick={() => setTab('scenes')}>
+          <button type="button" className={tab === 'scenes' ? 'tab active' : 'tab'} onClick={() => setTab('scenes')}>
             <Icon name="scenes" />
-            Start from a scenario
+            从场景开始
           </button>
-          <button className={tab === 'commands' ? 'tab active' : 'tab'} onClick={() => setTab('commands')}>
+          <button type="button" className={tab === 'commands' ? 'tab active' : 'tab'} onClick={() => setTab('commands')}>
             <Icon name="commands" />
-            Build manually
+            手动选择
           </button>
           <button
+            type="button"
             className={tab === 'generator' ? 'tab active' : 'tab'}
             onClick={() => (canAccessGenerator ? setTab('generator') : null)}
             disabled={!canAccessGenerator}
           >
             <Icon name="generator" />
-            Execution workspace (not a starting point)
+            执行工作区（非起点）
           </button>
-          <button className={tab === 'workflows' ? 'tab active' : 'tab'} onClick={() => setTab('workflows')}>
+          <button type="button" className={tab === 'workflows' ? 'tab active' : 'tab'} onClick={() => setTab('workflows')}>
             <Icon name="workflows" />
             工作流
           </button>
           {activeWorkflowId && (
-            <button className={tab === 'workflow-run' ? 'tab active' : 'tab'} onClick={() => setTab('workflow-run')}>
+            <button
+              type="button"
+              className={tab === 'workflow-run' ? 'tab active' : 'tab'}
+              onClick={() => setTab('workflow-run')}
+            >
               <Icon name="steps" />
               步骤
             </button>
           )}
-          <button className={tab === 'history' ? 'tab active' : 'tab'} onClick={() => setTab('history')}>
+          <button type="button" className={tab === 'history' ? 'tab active' : 'tab'} onClick={() => setTab('history')}>
             <Icon name="history" />
             历史
           </button>
@@ -1112,6 +1398,13 @@ export default function App() {
 
       {tab === 'scenes' && (
         <div className="layout">
+          <div className="panel-card scene-intro">
+            <div className="panel-title">如何开始</div>
+            <div className="scene-intro-text">从场景开始，获得引导路径。</div>
+            <button className="btn ghost" onClick={() => setTab('commands')}>
+              想手动？查看命令
+            </button>
+          </div>
           <section>
             <h3 className="section-title">
               <Icon name="workflows" /> 工作流场景
@@ -1130,39 +1423,91 @@ export default function App() {
       {tab === 'commands' && (
         <div className="layout">
           <StageProgressBar status={guidanceState.stageStatus} />
-          {Object.entries(groupedCommands).map(([stage, cmds]) => (
-            <section key={stage} className="section-shell">
-              <h3 className="section-title">
-                <Icon name="commands" />
-                {stageLabels[stage] ?? stage}（{cmds.length}）
-              </h3>
-              <div className="card-grid">
-                {cmds.map((c) => (
-                  <div key={c.id} className="card">
-                    <div className="card-title">
-                      {c.displayName}{' '}
-                      <span
-                        className={`badge ${
-                          c.constraintLevel === 'strong'
-                            ? 'rigor-strict'
-                            : c.constraintLevel === 'medium'
-                              ? 'rigor-standard'
-                              : 'rigor-lite'
-                        }`}
-                      >
-                        {constraintLabel[c.constraintLevel]}
-                      </span>
-                      {c.constraintLevel === 'strong' && <span className="badge severity-high">高风险</span>}
-                    </div>
-                    <div className="card-sub">{c.description}</div>
-                    <button className="btn secondary" onClick={() => setCommandAndSwitch(c.id)}>
-                      生成
-                    </button>
-                  </div>
+          <div className="filter-bar">
+            <div className="filter-group">
+              <span className="filter-label">阶段</span>
+              <select
+                className="select"
+                value={commandStageFilter}
+                onChange={(e) => setCommandStageFilter(e.target.value as 'all' | StageKey)}
+              >
+                <option value="all">全部阶段</option>
+                {stageFlow.map((stage) => (
+                  <option key={stage} value={stage}>
+                    {stageLabels[stage]}
+                  </option>
                 ))}
-              </div>
+              </select>
+            </div>
+            <div className="filter-group">
+              <span className="filter-label">严格度</span>
+              <select
+                className="select"
+                value={commandRigorFilter}
+                onChange={(e) => setCommandRigorFilter(e.target.value as 'all' | 'weak' | 'medium' | 'strong')}
+              >
+                <option value="all">全部</option>
+                <option value="weak">轻量</option>
+                <option value="medium">标准</option>
+                <option value="strong">严格</option>
+              </select>
+            </div>
+            <div className="filter-group">
+              <span className="filter-label">领域</span>
+              <select
+                className="select"
+                value={commandDomainFilter}
+                onChange={(e) => setCommandDomainFilter(e.target.value as 'all' | 'general' | 'specialized')}
+              >
+                <option value="all">通用 + 专项</option>
+                <option value="general">通用</option>
+                <option value="specialized">专项</option>
+              </select>
+            </div>
+          </div>
+
+          {commandDomainFilter !== 'specialized' &&
+            stageFlow.map((stage) => {
+              const cmds = groupedGeneralCommands[stage] ?? [];
+              if (cmds.length === 0) return null;
+              return (
+                <section key={stage} className="section-shell">
+                  <h3 className="section-title">
+                    <Icon name="commands" />
+                    {stageLabels[stage]}（{cmds.length}）
+                  </h3>
+                  <div className="card-grid">{cmds.map(renderCommandCard)}</div>
+                </section>
+              );
+            })}
+
+          {commandDomainFilter !== 'general' && (
+            <section className="section-shell specialized-shell">
+              <button
+                className={`section-toggle ${filteredSpecializedCommands.length === 0 ? 'is-muted' : ''}`}
+                onClick={() => setShowSpecializedCommands((prev) => !prev)}
+                disabled={filteredSpecializedCommands.length === 0}
+              >
+                专项命令（{filteredSpecializedCommands.length}）
+              </button>
+              {showSpecializedCommands && filteredSpecializedCommands.length > 0 && (
+                <div className="specialized-group">
+                  {stageFlow.map((stage) => {
+                    const cmds = groupedSpecializedCommands[stage] ?? [];
+                    if (cmds.length === 0) return null;
+                    return (
+                      <div key={stage} className="specialized-stage">
+                        <div className="specialized-stage-title">
+                          {stageLabels[stage]}（{cmds.length}）
+                        </div>
+                        <div className="card-grid">{cmds.map(renderCommandCard)}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </section>
-          ))}
+          )}
         </div>
       )}
 
@@ -1187,10 +1532,10 @@ export default function App() {
               {draftRestored && <div className="draft-notice">已恢复上次草稿</div>}
               {workflowSuggestion && <div className="suggestion-notice">{workflowSuggestion}</div>}
               <div className="panel-card">
-                <div className="panel-title">Command</div>
+                <div className="panel-title">命令</div>
                 <div className="command-title">{selectedCommand.displayName}</div>
                 <div className="required-checklist">
-                  <div className="panel-title">Required Checklist</div>
+                  <div className="panel-title">必填检查</div>
                   <div className="checklist-items">
                     {checklistItems.map((item) => {
                       const content = (
@@ -1198,7 +1543,7 @@ export default function App() {
                           <span className={`checklist-dot ${item.complete ? 'done' : 'todo'}`} />
                           <span className="checklist-label">{item.label}</span>
                           <span className={`checklist-status ${item.complete ? 'done' : 'todo'}`}>
-                            {item.complete ? 'Complete' : 'Missing'}
+                            {item.complete ? '已完成' : '缺失'}
                           </span>
                         </>
                       );
@@ -1220,7 +1565,7 @@ export default function App() {
                 <select value={selectedCommand.id} onChange={(e) => selectCommandWithGuardrail(e.target.value)} className="select">
                   {sortedCommands.map((c) => (
                     <option key={c.id} value={c.id}>
-                      {c.displayName} ({stageLabels[c.stage]})
+                      {c.displayName}
                     </option>
                   ))}
                 </select>
@@ -1229,7 +1574,11 @@ export default function App() {
               {basicSections.map((section) => (
                 <div key={section.key} id={`section-${section.key}`} className="panel-card">
                   <div className="panel-title">{section.title}</div>
-                  <div className="form">{section.fields.map((f) => renderField(f))}</div>
+                  <div className="form">
+                    {section.fields.map((f) =>
+                      renderField(f, { hideLabel: section.fields.length === 1 && section.title === f.label }),
+                    )}
+                  </div>
                   {section.key === 'intent' && intentFeedback && (
                     <div className={`quality-feedback ${intentFeedback.status}`}>{intentFeedback.message}</div>
                   )}
@@ -1246,8 +1595,8 @@ export default function App() {
                   onClick={() => setShowAdvanced((prev) => !prev)}
                 >
                   {showAdvanced
-                    ? `Hide advanced options · ${advancedRequiredFields.length} required`
-                    : `Advanced options · ${advancedRequiredFields.length} required`}
+                    ? `隐藏高级选项 · 必填 ${advancedRequiredFields.length} 项`
+                    : `高级选项 · 必填 ${advancedRequiredFields.length} 项`}
                 </button>
               </div>
 
@@ -1256,7 +1605,11 @@ export default function App() {
                   {advancedSections.map((section) => (
                     <div key={section.key} id={`section-${section.key}`} className="panel-card">
                       <div className="panel-title">{section.title}</div>
-                      <div className="form">{section.fields.map((f) => renderField(f))}</div>
+                      <div className="form">
+                        {section.fields.map((f) =>
+                          renderField(f, { hideLabel: section.fields.length === 1 && section.title === f.label }),
+                        )}
+                      </div>
                       {section.key === 'constraints' && constraintsFeedback && (
                         <div className={`quality-feedback ${constraintsFeedback.status}`}>{constraintsFeedback.message}</div>
                       )}
@@ -1264,7 +1617,7 @@ export default function App() {
                   ))}
 
                   <div className="panel-card">
-                    <div className="panel-title">Attachments</div>
+                    <div className="panel-title">附件</div>
                     <label className="btn secondary file-picker">
                       选择文件
                       <input type="file" multiple className="file-input" onChange={(e) => handleFileUpload(e.target.files)} />
@@ -1319,11 +1672,11 @@ export default function App() {
               )}
 
               <div className="panel-card">
-                <div className="panel-title">Variables</div>
+                <div className="panel-title">变量</div>
                 <div className="inline-actions">
                   <input
                     className="input"
-                    placeholder="变量名（如 plan_output_path）"
+                    placeholder="变量名"
                     value={newVarKey}
                     onChange={(e) => setNewVarKey(e.target.value)}
                   />
@@ -1333,14 +1686,16 @@ export default function App() {
                   </button>
                 </div>
                 {Object.keys(variables).length > 0 && (
-                  <div className="muted small">当前变量：{Object.entries(variables).map(([k, v]) => `${k}=${v}`).join(' | ')}</div>
+                  <div className="muted small">
+                    当前变量 <code>{Object.entries(variables).map(([k, v]) => `${k}=${v}`).join(' | ')}</code>
+                  </div>
                 )}
               </div>
             </div>
             <div className="panel-card actions-panel">
-              <div className="panel-title actions-kicker">Next step</div>
-              <div className="actions-title">Generate &amp; Save</div>
-              <div className="actions-subtitle">Create the final command output, then copy or export it.</div>
+              <div className="panel-title actions-kicker">下一步</div>
+              <div className="actions-title">生成并保存</div>
+              <div className="actions-subtitle">生成最终命令文本，可复制或导出。</div>
               <div className="inline-actions">
                 <button className="btn primary" disabled={!canGenerate} onClick={handleAddHistory}>
                   生成并保存
@@ -1366,8 +1721,12 @@ export default function App() {
               {missingRequired.length > 0 && (
                 <div className="muted small">缺少必填字段：{missingRequired.map((f) => f.label).join('、')}</div>
               )}
-              {missingVars.length > 0 && <div className="muted small">缺少变量：{missingVars.join(', ')}</div>}
-              {draftSavedAt && <div className="muted small">Draft autosaved to local storage at {formatDate(draftSavedAt)}.</div>}
+              {missingVars.length > 0 && (
+                <div className="muted small">
+                  缺少变量 <code>{missingVars.join(', ')}</code>
+                </div>
+              )}
+              {draftSavedAt && <div className="muted small">草稿已自动保存：{formatDate(draftSavedAt)}。</div>}
             </div>
           </section>
 
@@ -1387,7 +1746,7 @@ export default function App() {
                 </div>
               </div>
               <div className="preview-surface">
-                <div className="muted small preview-note">Edits here affect output only and do not update input fields.</div>
+                <div className="muted small preview-note">此处编辑仅影响输出，不会回写输入字段。</div>
                 <textarea
                   className="preview"
                   value={previewText}
@@ -1395,7 +1754,9 @@ export default function App() {
                   placeholder="可直接编辑预览内容（不回写表单）"
                 />
               </div>
-              <div className="muted small">缺失变量将显示为 &lt;&lt;MISSING:var&gt;&gt; ，必填字段缺失会阻断“生成并保存”。</div>
+              <div className="muted small">
+                缺失变量将显示为 <code>&lt;&lt;MISSING:var&gt;&gt;</code>，必填字段缺失会阻断“生成并保存”。
+              </div>
             </div>
           </section>
         </div>
@@ -1421,10 +1782,10 @@ export default function App() {
                   <div key={w.id} className="card">
                     <div className="card-title">{w.title}</div>
                     <div className="workflow-meta">
-                      {w.intendedScenario && <div className="workflow-meta-row">Intended scenario: {w.intendedScenario}</div>}
-                      {w.audience && <div className="workflow-meta-row">For: {w.audience === 'new user' ? 'New user' : 'Power user'}</div>}
+                      {w.intendedScenario && <div className="workflow-meta-row">适用场景：{w.intendedScenario}</div>}
+                      {w.audience && <div className="workflow-meta-row">适用人群：{w.audience === 'new user' ? '新手' : '高阶用户'}</div>}
                       <div className="workflow-meta-row">
-                        Optional stages: {optionalStages.length > 0 ? optionalStages.join(', ') : 'None'}
+                        可选阶段：{optionalStages.length > 0 ? optionalStages.join('、') : '无'}
                       </div>
                     </div>
                   <div className="workflow-steps">
@@ -1453,198 +1814,368 @@ export default function App() {
       )}
 
       {tab === 'workflow-run' && activeWorkflow && currentStep && workflowCommand && workflowFormState && (
-        <div className="layout columns">
-          <section className="column">
-            <h3>{activeWorkflow.title}</h3>
-            <div className="stepper">
-              {activeWorkflow.steps.map((step, idx) => {
-                const status = workflowStepStatus[step.stepId];
-                return (
-                  <button key={step.stepId} className={`step ${idx === workflowStepIndex ? 'active' : ''}`} onClick={() => setWorkflowStepIndex(idx)}>
-                    {idx + 1}. {step.commandId} {step.optional ? '(可选)' : ''} {status === 'done' ? '✓' : status === 'skipped' ? '→' : ''}
-                  </button>
-                );
-              })}
-            </div>
-            <div className="inline-actions">
-              <button
-                className="btn ghost"
-                onClick={() => setWorkflowStepIndex((prev) => (prev > 0 ? prev - 1 : prev))}
-              >
-                上一步
-              </button>
-              <button
-                className="btn ghost"
-                onClick={() =>
-                  setWorkflowStepIndex((prev) =>
-                    activeWorkflow && prev < activeWorkflow.steps.length - 1 ? prev + 1 : prev,
-                  )
-                }
-              >
-                下一步
-              </button>
-              <button className="btn ghost" onClick={handleWorkflowReset}>
-                退出工作流
-              </button>
-            </div>
-            <div className="divider" />
-            <h3>变量</h3>
-            <div className="inline-actions">
-              <input className="input" placeholder="变量名" value={workflowVarKey} onChange={(e) => setWorkflowVarKey(e.target.value)} />
-              <input className="input" placeholder="变量值" value={workflowVarValue} onChange={(e) => setWorkflowVarValue(e.target.value)} />
-              <button className="btn secondary" onClick={addWorkflowVariable}>
-                添加
-              </button>
-            </div>
-            {Object.keys(workflowVariables).length > 0 && (
-              <div className="muted small">{Object.entries(workflowVariables).map(([k, v]) => `${k}=${v}`).join(' | ')}</div>
-            )}
-          </section>
-
-          <section className="column">
-            <h3>步骤：{workflowCommand.displayName}</h3>
-            <div className="form">
-              {workflowCommand.fields.map((f) => (
-                <div key={f.id} className="field">
-                  <label>
-                    {f.label}
-                    {f.required && <span className="required">*</span>}
-                  </label>
-                  {f.type === 'select' ? (
-                    <select value={String(workflowFormState[f.id] ?? '')} onChange={(e) => updateWorkflowField(f.id, e.target.value)} className="input">
-                      {(f.options ?? []).map((o) => (
-                        <option key={o} value={o}>
-                          {o}
-                        </option>
-                      ))}
-                    </select>
-                  ) : f.type === 'boolean' ? (
-                    <input type="checkbox" checked={Boolean(workflowFormState[f.id])} onChange={(e) => updateWorkflowField(f.id, e.target.checked)} />
-                  ) : f.type === 'path' ? (
-                    <div className="input-row">
-                      <input
-                        className="input"
-                        value={(workflowFormState[f.id] as string) ?? ''}
-                        placeholder="选择或输入路径"
-                        onChange={(e) => updateWorkflowField(f.id, e.target.value)}
-                      />
-                      <button
-                        className="btn ghost"
-                        type="button"
-                        disabled={!supportsDirectoryPicker}
-                        onClick={() => pickDirectory((value) => updateWorkflowField(f.id, value))}
-                      >
-                        <Icon name="folder" /> 选文件夹
-                      </button>
+        <div className="layout workflow-layout">
+          <div className="panel-card workflow-hero">
+            <div className="workflow-hero-main">
+              <div className="panel-title">工作流概览</div>
+              <div className="workflow-hero-title">{activeWorkflow.title}</div>
+              <div className="workflow-hero-subtitle">
+                {activeWorkflow.description ?? activeWorkflow.intendedScenario ?? '按步骤完成工作流并保持输出一致。'}
+              </div>
+              {(activeWorkflow.intendedScenario || workflowOptionalLabels.length > 0) && (
+                <div className="workflow-guidance">
+                  {activeWorkflow.intendedScenario && (
+                    <div className="workflow-guidance-line">
+                      适用场景：{activeWorkflow.intendedScenario}
                     </div>
-                  ) : f.type === 'list' ? (
-                    <>
-                      <textarea
-                        className="input"
-                        rows={3}
-                        placeholder="每行一项"
-                        value={(workflowFormState[f.id] as string[] | undefined)?.join('\n') ?? ''}
-                        onChange={(e) => updateWorkflowList(f.id, e.target.value)}
-                      />
-                      <button className="btn danger" type="button" onClick={() => clearWorkflowFieldValue(f.id, f.type)}>
-                        <Icon name="trash" /> 清空多行内容
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <textarea
-                        className="input"
-                        rows={f.type === 'text' ? 2 : 4}
-                        value={(workflowFormState[f.id] as string) ?? ''}
-                        onChange={(e) => updateWorkflowField(f.id, e.target.value)}
-                      />
-                      {f.type === 'multiline' && (
-                        <button className="btn danger" type="button" onClick={() => clearWorkflowFieldValue(f.id, f.type)}>
-                          <Icon name="trash" /> 清空多行内容
-                        </button>
-                      )}
-                    </>
+                  )}
+                  {workflowOptionalLabels.length > 0 && (
+                    <div className="workflow-guidance-line">
+                      高阶用户常跳过：<code>{workflowOptionalLabels.join('、')}</code>
+                    </div>
                   )}
                 </div>
-              ))}
-            </div>
-            <div className="inline-actions" style={{ marginTop: 8 }}>
-              <button className="btn primary" disabled={!canGenerateWorkflowStep} onClick={handleWorkflowGenerate}>
-                生成并保存
-              </button>
-              <button className="btn tertiary" onClick={applyBindingsForStep}>
-                应用变量绑定
-              </button>
-              <button className="btn tertiary" onClick={handleWorkflowSkip}>
-                跳过此步
-              </button>
-            </div>
-            {workflowMissingRequired.length > 0 && (
-              <div className="muted small">缺少必填字段：{workflowMissingRequired.map((f) => f.label).join('、')}</div>
-            )}
-            {workflowMissingVars.length > 0 && <div className="muted small">缺少变量：{workflowMissingVars.join(', ')}</div>}
-            <div className="divider" />
-            <h3>附件</h3>
-            <label className="btn secondary file-picker">
-              选择文件
-              <input type="file" multiple className="file-input" onChange={(e) => handleWorkflowFileUpload(e.target.files)} />
-            </label>
-            <div className="inline-actions">
-              <select value={workflowAttachmentTarget} onChange={(e) => setWorkflowAttachmentTarget(e.target.value)} className="select">
-                {workflowCommand.fields
-                  .filter((f) => f.type !== 'select' && f.type !== 'boolean')
-                  .map((f) => (
-                    <option key={f.id} value={f.id}>
-                      插入到：{f.label}
-                    </option>
-                  ))}
-              </select>
-              <select
-                value={workflowAttachmentMode}
-                onChange={(e) => setWorkflowAttachmentMode(e.target.value as 'path' | 'snippet' | 'full')}
-                className="select"
-              >
-                <option value="path">仅路径</option>
-                <option value="snippet">片段</option>
-                <option value="full">全文</option>
-              </select>
-            </div>
-            <div className="attachment-list">
-              {workflowAttachmentsList.map((a) => (
-                <div key={a.name} className="pill">
-                  {a.name}
-                </div>
-              ))}
-            </div>
-            {workflowAttachmentsList.length > 0 && (
-              <button className="btn tertiary" onClick={() => insertWorkflowAttachments(workflowAttachmentTarget, workflowAttachmentMode)}>
-                插入到字段
-              </button>
-            )}
-          </section>
-
-          <section className="column">
-            <h3>预览</h3>
-            <textarea
-              className="preview"
-              value={workflowPreviewText}
-              onChange={(e) => setWorkflowPreviewOverrides((prev) => ({ ...prev, [currentStep.stepId]: e.target.value }))}
-              placeholder="可直接编辑预览内容（不回写表单）"
-            />
-            <div className="inline-actions">
-              <button className="btn secondary" onClick={() => handleWorkflowExport('md', supportsSave ? 'save' : 'download')}>
-                <Icon name="export" /> 保存 .md
-              </button>
-              <button className="btn ghost" onClick={() => handleWorkflowExport('txt', 'download')}>
-                <Icon name="download" /> 下载 .txt
-              </button>
-              {supportsShare && (
-                <button className="btn ghost" onClick={() => handleWorkflowExport('txt', 'share')}>
-                  <Icon name="share" /> 分享
-                </button>
               )}
+              <div className="workflow-hero-tags">
+                {activeWorkflow.audience && (
+                  <span className="badge">{activeWorkflow.audience === 'new user' ? '适合新手' : '适合高阶用户'}</span>
+                )}
+                {currentStep.optional && <span className="badge optional">可选</span>}
+                <span className="badge">{stageLabels[workflowCommand.stage]}</span>
+              </div>
             </div>
-          </section>
+            <div className="workflow-hero-progress">
+              <div className="workflow-progress-header">
+                <div className="panel-title">进度</div>
+                <div className="workflow-progress-count">
+                  {workflowCurrentNumber}/{workflowStepTotal}
+                </div>
+              </div>
+              <div className="workflow-progress-bar">
+                <span style={{ width: `${workflowProgressPercent}%` }} />
+              </div>
+              <div className="workflow-progress-meta">
+                已完成 {workflowCompletedCount} · 已跳过 {workflowSkippedCount} · 剩余 {workflowRemainingCount}
+              </div>
+              <div className="workflow-next-panel">
+                <div className="panel-title">下一步</div>
+                {workflowNextStep ? (
+                  <div className="workflow-next-step">
+                    <div className="workflow-next-title">
+                      {workflowCurrentNumber + 1}. {workflowNextCommand?.displayName ?? workflowNextStep.commandId}
+                    </div>
+                    <div className="workflow-next-meta">
+                      {workflowNextStep.optional && <span className="badge optional">可选</span>}
+                      {workflowNextCommand && <span className="badge">{stageLabels[workflowNextCommand.stage]}</span>}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="muted small">已进入最后一步，完成即可结束工作流。</div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {feedbackMessage && <div className="success-notice workflow-feedback">{feedbackMessage}</div>}
+
+          <div className="workflow-columns">
+            <section className="workflow-rail">
+              <div className="panel-card journey-panel">
+                <div className="panel-title">流程地图</div>
+                <div className="journey-steps">
+                  {activeWorkflow.steps.map((step, idx) => {
+                    const status = workflowStepStatus[step.stepId] ?? 'pending';
+                    const isCurrent = idx === workflowStepIndex;
+                    const command = commandLookup.get(step.commandId);
+                    const label = command?.displayName ?? step.commandId;
+                    const statusKey = status === 'done' || status === 'skipped' ? status : isCurrent ? 'current' : 'todo';
+                    const statusLabel = status === 'done' ? '已完成' : status === 'skipped' ? '已跳过' : isCurrent ? '进行中' : '待处理';
+                    const statusClass = status === 'done' ? 'done' : status === 'skipped' ? 'skipped' : isCurrent ? 'current' : 'upcoming';
+                    return (
+                      <button
+                        key={step.stepId}
+                        className={`journey-step ${statusClass} ${step.optional ? 'optional' : ''}`}
+                        onClick={() => moveToWorkflowStep(idx)}
+                      >
+                        <div className="journey-step-index">{idx + 1}</div>
+                        <div className="journey-step-body">
+                          <div className="journey-step-title">
+                            {command ? `${stageLabels[command.stage]} · ${label}` : label}
+                            {step.optional && <span className="badge optional">可选</span>}
+                          </div>
+                          <div className="journey-step-meta">
+                            <span className={`badge status-${statusKey}`}>{statusLabel}</span>
+                            {command && <span className="badge">{stageLabels[command.stage]}</span>}
+                            {step.optional && <span className="journey-step-note muted small">跳过后仍可继续工作流。</span>}
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="divider" />
+                <div className="inline-actions">
+                  <button
+                    className="btn ghost"
+                    onClick={() => moveToWorkflowStep(workflowStepIndex - 1)}
+                    disabled={workflowStepIndex === 0}
+                  >
+                    上一步
+                  </button>
+                  <button
+                    className="btn ghost"
+                    onClick={() => moveToWorkflowStep(workflowStepIndex + 1)}
+                    disabled={workflowStepIndex >= workflowStepTotal - 1}
+                  >
+                    下一步
+                  </button>
+                </div>
+                <button className="btn ghost" onClick={handleWorkflowReset}>
+                  退出工作流
+                </button>
+              </div>
+
+              <div className="panel-card">
+                <div className="panel-title">变量</div>
+                <div className="inline-actions">
+                  <input className="input" placeholder="变量名" value={workflowVarKey} onChange={(e) => setWorkflowVarKey(e.target.value)} />
+                  <input className="input" placeholder="变量值" value={workflowVarValue} onChange={(e) => setWorkflowVarValue(e.target.value)} />
+                  <button className="btn secondary" onClick={addWorkflowVariable}>
+                    添加
+                  </button>
+                </div>
+                {Object.keys(workflowVariables).length > 0 && (
+                  <div className="muted small">
+                    当前变量 <code>{Object.entries(workflowVariables).map(([k, v]) => `${k}=${v}`).join(' | ')}</code>
+                  </div>
+                )}
+              </div>
+            </section>
+
+            <section className="workflow-main">
+              <div className="panel-card">
+                <div className="panel-title">当前步骤</div>
+                <div className="command-title">{workflowCommand.displayName}</div>
+                <div className="muted small">{workflowStepFraming}</div>
+                <div className="workflow-step-meta">
+                  <span
+                    className={`badge status-${workflowCurrentStatus === 'pending' ? 'current' : workflowCurrentStatus}`}
+                  >
+                    {workflowCurrentStatus === 'done' ? '已完成' : workflowCurrentStatus === 'skipped' ? '已跳过' : '进行中'}
+                  </span>
+                  {currentStep.optional && <span className="badge optional">可选</span>}
+                  <span className="badge">{stageLabels[workflowCommand.stage]}</span>
+                </div>
+                <div className="muted small">
+                  步骤 {workflowCurrentNumber} / {workflowStepTotal}
+                </div>
+                {currentStep.optional && (
+                  <div className="muted small">可选步骤，跳过不会阻断工作流。</div>
+                )}
+              </div>
+
+              <div className="panel-card" id="workflow-inputs">
+                <div className="panel-title">输入</div>
+                <div className="form">
+                  {workflowCommand.fields.map((f) => {
+                    const inputId = `workflow-${currentStep?.stepId ?? 'step'}-${f.id}`;
+                    return (
+                      <div key={f.id} className="field">
+                        <label htmlFor={inputId}>
+                          {f.label}
+                          {f.required && <span className="required">*</span>}
+                        </label>
+                        {f.type === 'select' ? (
+                          <select
+                            id={inputId}
+                            value={String(workflowFormState[f.id] ?? '')}
+                            onChange={(e) => updateWorkflowField(f.id, e.target.value)}
+                            className="input"
+                          >
+                            {(f.options ?? []).map((option) => {
+                              const normalized = normalizeOption(option);
+                              return (
+                                <option key={normalized.value} value={normalized.value}>
+                                  {normalized.label}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        ) : f.type === 'boolean' ? (
+                          <input
+                            id={inputId}
+                            aria-label={f.label}
+                            type="checkbox"
+                            checked={Boolean(workflowFormState[f.id])}
+                            onChange={(e) => updateWorkflowField(f.id, e.target.checked)}
+                          />
+                        ) : f.type === 'path' ? (
+                          <div className="input-row">
+                            <input
+                              id={inputId}
+                              className="input"
+                              value={(workflowFormState[f.id] as string) ?? ''}
+                              placeholder="选择或输入路径"
+                              onChange={(e) => updateWorkflowField(f.id, e.target.value)}
+                            />
+                            <button
+                              className="btn secondary"
+                              type="button"
+                              disabled={!supportsDirectoryPicker}
+                              onClick={() => pickDirectory((value) => updateWorkflowField(f.id, value))}
+                            >
+                              <Icon name="folder" /> 选文件夹
+                            </button>
+                          </div>
+                        ) : f.type === 'list' ? (
+                          <>
+                            <textarea
+                              id={inputId}
+                              className="input"
+                              rows={3}
+                              placeholder="每行一项"
+                              value={(workflowFormState[f.id] as string[] | undefined)?.join('\n') ?? ''}
+                              onChange={(e) => updateWorkflowList(f.id, e.target.value)}
+                            />
+                            <button className="btn danger" type="button" onClick={() => clearWorkflowFieldValue(f.id, f.type)}>
+                              <Icon name="trash" /> 清空多行内容
+                            </button>
+                          </>
+                        ) : (
+                          <>
+                            <textarea
+                              id={inputId}
+                              className="input"
+                              rows={f.type === 'text' ? 2 : 4}
+                              value={(workflowFormState[f.id] as string) ?? ''}
+                              onChange={(e) => updateWorkflowField(f.id, e.target.value)}
+                            />
+                            {f.type === 'multiline' && (
+                              <button className="btn danger" type="button" onClick={() => clearWorkflowFieldValue(f.id, f.type)}>
+                                <Icon name="trash" /> 清空多行内容
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="panel-card actions-panel">
+                <div className="panel-title actions-kicker">操作</div>
+                <div className="actions-title">
+                  {workflowCurrentStatus === 'done' && workflowNextStep ? '继续' : '生成本步输出'}
+                </div>
+                <div className="actions-subtitle">
+                  {workflowCurrentStatus === 'done' && workflowNextStep
+                    ? '准备好后进入下一步。'
+                    : workflowCurrentStatus === 'done'
+                      ? '该工作流已全部完成。'
+                      : '请先生成并保存本步输出，再继续。'}
+                </div>
+                <div className="inline-actions">
+                  {workflowCurrentStatus === 'done' && workflowNextStep ? (
+                    <button className="btn primary" onClick={() => moveToWorkflowStep(workflowStepIndex + 1)}>
+                      进入下一步
+                    </button>
+                  ) : (
+                    <button className="btn primary" disabled={!canGenerateWorkflowStep} onClick={handleWorkflowGenerate}>
+                      生成本步输出
+                    </button>
+                  )}
+                  <button className="btn secondary" onClick={() => scrollToWorkflowSection('workflow-inputs')}>
+                    编辑输入
+                  </button>
+                  <button className="btn secondary" onClick={showWorkflowSavedOutput} disabled={!workflowHasSavedOutput}>
+                    查看上次输出
+                  </button>
+                  <button className="btn ghost" onClick={handleWorkflowSkip}>
+                    跳过步骤
+                  </button>
+                </div>
+                {workflowMissingRequired.length > 0 && (
+                  <div className="muted small">缺少必填字段：{workflowMissingRequired.map((f) => f.label).join('、')}</div>
+                )}
+                {workflowMissingVars.length > 0 && (
+                  <div className="muted small">
+                    缺少变量 <code>{workflowMissingVars.join(', ')}</code>
+                  </div>
+                )}
+              </div>
+
+              <div className="panel-card">
+                <div className="panel-title">附件</div>
+                <label className="btn secondary file-picker">
+                  选择文件
+                  <input type="file" multiple className="file-input" onChange={(e) => handleWorkflowFileUpload(e.target.files)} />
+                </label>
+                <div className="inline-actions">
+                  <select value={workflowAttachmentTarget} onChange={(e) => setWorkflowAttachmentTarget(e.target.value)} className="select">
+                    {workflowCommand.fields
+                      .filter((f) => f.type !== 'select' && f.type !== 'boolean')
+                      .map((f) => (
+                        <option key={f.id} value={f.id}>
+                          插入到：{f.label}
+                        </option>
+                      ))}
+                  </select>
+                  <select
+                    value={workflowAttachmentMode}
+                    onChange={(e) => setWorkflowAttachmentMode(e.target.value as 'path' | 'snippet' | 'full')}
+                    className="select"
+                  >
+                    <option value="path">仅路径</option>
+                    <option value="snippet">片段</option>
+                    <option value="full">全文</option>
+                  </select>
+                </div>
+                <div className="attachment-list">
+                  {workflowAttachmentsList.map((a) => (
+                    <div key={a.name} className="pill">
+                      {a.name}
+                    </div>
+                  ))}
+                </div>
+                {workflowAttachmentsList.length > 0 && (
+                  <button className="btn tertiary" onClick={() => insertWorkflowAttachments(workflowAttachmentTarget, workflowAttachmentMode)}>
+                    插入到字段
+                  </button>
+                )}
+              </div>
+            </section>
+
+            <section className="workflow-preview" id="workflow-preview">
+              <div className="preview-panel">
+                <div className="preview-header">
+                  <h3>预览与输出</h3>
+                  <div className="preview-toolbar">
+                    <button className="btn secondary" onClick={() => handleWorkflowExport('md', supportsSave ? 'save' : 'download')}>
+                      <Icon name="export" /> 保存 .md
+                    </button>
+                    <button className="btn ghost" onClick={() => handleWorkflowExport('txt', 'download')}>
+                      <Icon name="download" /> 下载 .txt
+                    </button>
+                    {supportsShare && (
+                      <button className="btn ghost" onClick={() => handleWorkflowExport('txt', 'share')}>
+                        <Icon name="share" /> 分享
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className="preview-surface">
+                  <div className="muted small preview-note">此处编辑仅影响输出，不会回写输入字段。</div>
+                  <textarea
+                    className="preview"
+                    value={workflowPreviewText}
+                    onChange={(e) => setWorkflowPreviewOverrides((prev) => ({ ...prev, [currentStep.stepId]: e.target.value }))}
+                    placeholder="可直接编辑预览内容（不回写表单）"
+                  />
+                </div>
+              </div>
+            </section>
+          </div>
         </div>
       )}
       {tab === 'history' && (
@@ -1653,10 +2184,12 @@ export default function App() {
             <h3>历史记录</h3>
             <div className="card-grid">
               {history.length === 0 && <div className="muted">暂无历史</div>}
-              {history.map((h) => (
+              {history.map((h) => {
+                const commandLabel = commandLookup.get(h.commandId)?.displayName ?? h.commandId;
+                return (
                 <div key={h.id} className="card history-card">
                   <div className="card-title">
-                    {h.commandId} <span className="card-sub">{formatDate(h.createdAt)}</span>
+                    <code>{commandLabel}</code> <span className="card-sub">{formatDate(h.createdAt)}</span>
                   </div>
                   <pre className="small muted code">
                     {h.commandText.slice(0, 200)}
@@ -1680,7 +2213,8 @@ export default function App() {
                     </button>
                   </div>
                 </div>
-              ))}
+              );
+              })}
             </div>
           </section>
         </div>
@@ -1688,3 +2222,6 @@ export default function App() {
     </div>
   );
 }
+
+
+

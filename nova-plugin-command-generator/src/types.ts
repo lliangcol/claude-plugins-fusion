@@ -7,7 +7,7 @@ export interface FieldDefinition {
   label: string;
   type: FieldType;
   required?: boolean;
-  options?: string[];
+  options?: Array<string | { value: string; label: string }>;
   defaultValue?: string | boolean | string[];
   bindable?: boolean;
   help?: string;

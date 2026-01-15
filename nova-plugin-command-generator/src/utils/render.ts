@@ -1,4 +1,4 @@
-import { CommandDefinition, FieldDefinition, FormState } from '../types';
+﻿import { CommandDefinition, FieldDefinition, FormState } from '../types';
 
 const listify = (value: unknown) => {
   if (Array.isArray(value)) return value;
@@ -42,9 +42,9 @@ export const stageOrder: Record<string, number> = {
 };
 
 export const constraintLabel: Record<string, string> = {
-  strong: '强',
-  medium: '中',
-  weak: '弱',
+  strong: '严格',
+  medium: '标准',
+  weak: '轻量',
 };
 
 export const constraintOrder: Record<string, number> = {
@@ -52,3 +52,4 @@ export const constraintOrder: Record<string, number> = {
   medium: 2,
   strong: 3,
 };
+

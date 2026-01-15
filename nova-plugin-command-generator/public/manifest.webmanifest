@@ -3,8 +3,8 @@
   "short_name": "CmdGen",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#f7f8fa",
-  "theme_color": "#0f172a",
+  "background_color": "#f2f6f7",
+  "theme_color": "#264653",
   "icons": [
     {
       "src": "/icon.svg",

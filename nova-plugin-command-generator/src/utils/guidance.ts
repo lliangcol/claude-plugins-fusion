@@ -29,11 +29,11 @@ const normalizeStageStatus = (status?: Partial<Record<StageKey, StageStatus>>) =
 });
 
 const stageLabel: Record<StageKey, string> = {
-  explore: 'Explore',
-  plan: 'Plan',
-  review: 'Review',
-  implement: 'Implement',
-  finalize: 'Finalize',
+  explore: '探索',
+  plan: '规划',
+  review: '评审',
+  implement: '实施',
+  finalize: '交付',
 };
 
 const defaultCommandsByStage: Record<StageKey, string[]> = {
@@ -45,7 +45,7 @@ const defaultCommandsByStage: Record<StageKey, string[]> = {
 };
 
 const selectCommandForStage = (stage: StageKey, context?: GuidanceContext) => {
-  if (context?.workflowTemplate && /java|backend/i.test(context.workflowTemplate)) {
+  if (context?.workflowTemplate === 'workflow-d') {
     if (stage === 'plan') return 'backend-plan';
   }
   return defaultCommandsByStage[stage][0];
@@ -57,8 +57,8 @@ export const recommendNext = (state: GuidanceState, context?: GuidanceContext): 
   const targetStage = activeStage ?? stageFlow.find((stage) => normalized.stageStatus[stage] !== 'done') ?? 'finalize';
   const command = selectCommandForStage(targetStage, context);
   const reason = activeStage
-    ? `Continue ${stageLabel[targetStage]} based on active stage.`
-    : `Next recommended stage is ${stageLabel[targetStage]}.`;
+    ? `根据当前进行阶段，建议继续${stageLabel[targetStage]}。`
+    : `下一步建议进入${stageLabel[targetStage]}。`;
   const severity = targetStage === 'review' ? 'warning' : undefined;
   return { stage: targetStage, command, reason, severity };
 };

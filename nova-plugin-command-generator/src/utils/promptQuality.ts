@@ -28,7 +28,6 @@ const actionVerbs = [
   'make',
   'derive',
   'explain',
-  'implement',
   'compare',
   'debug',
   'investigate',
@@ -78,27 +77,27 @@ const rule = (status: QualityStatus, message: string): QualityFeedback => ({ sta
 
 export const evaluateIntent = (raw: string): QualityFeedback => {
   const text = normalize(raw);
-  if (!text) return rule('weak', '⚠ Intent 还未填写，建议补充目标');
+  if (!text) return rule('weak', '意图尚未填写，建议补充目标。');
   const verb = hasActionVerb(text);
   const longEnough = text.length >= 12;
-  if (verb && longEnough) return rule('ok', '✔ Intent 已包含明确目标');
-  if (!verb) return rule('warning', '⚠ Intent 可加入动作动词，便于定位任务');
-  return rule('warning', '⚠ Intent 信息偏短，建议补充目标细节');
+  if (verb && longEnough) return rule('ok', '意图已包含明确目标。');
+  if (!verb) return rule('warning', '意图可加入动作动词，便于定位任务。');
+  return rule('warning', '意图信息偏短，建议补充目标细节。');
 };
 
 export const evaluateContext = (raw: string): QualityFeedback => {
   const text = normalize(raw);
-  if (!text) return rule('weak', '⚠ Context 还未填写，可能影响输出质量');
+  if (!text) return rule('weak', '上下文尚未填写，可能影响输出质量。');
   const hint = hasContextHint(text);
   const longEnough = text.length >= 16;
-  if (hint && longEnough) return rule('ok', '✔ Context 覆盖了系统/范围信息');
-  if (!hint) return rule('warning', '⚠ Context 信息偏少，建议补充范围或系统背景');
-  return rule('warning', '⚠ Context 可更具体，便于生成更贴合的结果');
+  if (hint && longEnough) return rule('ok', '上下文覆盖了系统或范围信息。');
+  if (!hint) return rule('warning', '上下文信息偏少，建议补充范围或系统背景。');
+  return rule('warning', '上下文可更具体，便于生成更贴合的结果。');
 };
 
 export const evaluateConstraints = (raw: string): QualityFeedback => {
   const text = normalize(raw);
-  if (!text) return rule('warning', '⚠ Constraints 可补充限制条件，提升可控性');
-  if (text.length < 8) return rule('warning', '⚠ Constraints 偏短，建议补充限制细节');
-  return rule('ok', '✔ Constraints 已提供关键约束');
+  if (!text) return rule('warning', '约束可补充限制条件，提升可控性。');
+  if (text.length < 8) return rule('warning', '约束偏短，建议补充限制细节。');
+  return rule('ok', '约束已提供关键限制。');
 };
