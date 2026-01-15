@@ -18,6 +18,12 @@ import { loadGuidanceState, recordGuidanceSuccess } from './store/guidance';
 import { loadDraft, saveDraft } from './store/draft';
 import { renderTemplate, stageOrder, constraintLabel, constraintOrder } from './utils/render';
 import { readAttachments } from './utils/attachments';
+import { normalizeOption } from './utils/options';
+import { Icon } from './components/Icon';
+import { StageProgressBar } from './components/StageProgressBar';
+import { GeneratorPanel } from './features/generator/GeneratorPanel';
+import { WorkflowRunPanel } from './features/workflow/WorkflowRunPanel';
+import { HistoryPanel } from './features/history/HistoryPanel';
 import { evaluateConstraints, evaluateContext, evaluateIntent, QualityFeedback } from './utils/promptQuality';
 import { buildCommandStageMap, recommendNext, stageFlow } from './utils/guidance';
 
@@ -35,151 +41,6 @@ const stageLabels: Record<string, string> = {
 
 const MAX_ATTACHMENT_BYTES = 200 * 1024;
 
-const icons = {
-  scenes: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M4 6h6l2 2h8v10H4z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-    </svg>
-  ),
-  commands: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M5 7h14M5 12h14M5 17h10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  ),
-  generator: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M6 7h12v10H6z" fill="none" stroke="currentColor" strokeWidth="1.6" />
-      <path d="M9 10h6M9 14h4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  ),
-  workflows: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M6 7h6v4H6zM12 13h6v4h-6z" fill="none" stroke="currentColor" strokeWidth="1.6" />
-      <path d="M12 9h6M6 15h6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  ),
-  steps: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M7 6h10M7 12h10M7 18h10" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-      <circle cx="5" cy="6" r="1.2" fill="currentColor" />
-      <circle cx="5" cy="12" r="1.2" fill="currentColor" />
-      <circle cx="5" cy="18" r="1.2" fill="currentColor" />
-    </svg>
-  ),
-  history: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M6 7h8l4 4v6H6z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-      <path d="M10 13h4M10 17h6" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  ),
-  folder: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M4 7h6l2 2h8v8H4z" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
-    </svg>
-  ),
-  trash: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M6 7h12M9 7V5h6v2M8 7l1 12h6l1-12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  ),
-  export: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M12 4v10M8 8l4-4 4 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-      <path d="M5 14v5h14v-5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  ),
-  download: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M12 4v10M8 10l4 4 4-4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-      <path d="M5 18h14" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  ),
-  share: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <circle cx="6" cy="12" r="2" fill="none" stroke="currentColor" strokeWidth="1.6" />
-      <circle cx="18" cy="6" r="2" fill="none" stroke="currentColor" strokeWidth="1.6" />
-      <circle cx="18" cy="18" r="2" fill="none" stroke="currentColor" strokeWidth="1.6" />
-      <path d="M8 11l8-4M8 13l8 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
-    </svg>
-  ),
-  check: (
-    <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M5 12l4 4L19 6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  ),
-};
-
-type IconName = keyof typeof icons;
-
-const Icon = ({ name, className }: { name: IconName; className?: string }) => (
-  <span className={className ?? 'icon'}>{icons[name]}</span>
-);
-
-const StageProgressBar = ({ status }: { status: Record<StageKey, StageStatus> }) => (
-  <div className="stage-progress">
-    {stageFlow.map((stage) => {
-      const state = status[stage] ?? 'todo';
-      return (
-        <div key={stage} className={`stage-item ${state}`}>
-          {state === 'done' && <Icon name="check" className="stage-icon" />}
-          <span className="stage-label">{stageLabels[stage]}</span>
-        </div>
-      );
-    })}
-  </div>
-);
-
-const NextStepCard = ({
-  recommendation,
-  onUse,
-  onBrowse,
-}: {
-  recommendation: GuidanceRecommendation;
-  onUse: () => void;
-  onBrowse: () => void;
-}) => (
-  <div className="next-step-card">
-    <div className="panel-title">下一步建议</div>
-    <div className="next-step-body">{recommendation.reason}</div>
-    <div className="next-step-actions">
-      <button className="btn secondary" onClick={onUse}>
-        使用命令 <code>{recommendation.command}</code>
-      </button>
-      <button className="btn ghost" onClick={onBrowse}>
-        查看其它命令
-      </button>
-    </div>
-  </div>
-);
-
-const GuardrailBanner = ({
-  visible,
-  onContinue,
-  onSwitch,
-}: {
-  visible: boolean;
-  onContinue: () => void;
-  onSwitch: () => void;
-}) =>
-  visible ? (
-    <div className="guardrail-banner">
-      <div className="guardrail-icon">
-        <Icon name="steps" />
-      </div>
-      <div className="guardrail-content">
-        <div className="guardrail-title">建议先完成规划与评审</div>
-        <div className="guardrail-body">这样可以降低返工风险并提升输出质量。</div>
-      </div>
-      <div className="guardrail-actions">
-      <button className="btn secondary" onClick={onContinue}>
-        继续执行
-      </button>
-        <button className="btn ghost" onClick={onSwitch}>
-          切换到推荐步骤
-        </button>
-      </div>
-    </div>
-  ) : null;
 
 const initForm = (cmd: CommandDefinition): FormState =>
   cmd.fields.reduce<FormState>((acc, f) => {
@@ -205,10 +66,6 @@ const getMissingVariables = (text: string) => {
 const getDefaultAttachmentTarget = (cmd: CommandDefinition) =>
   cmd.fields.find((f) => f.id === 'CONTEXT')?.id ?? cmd.fields[0]?.id ?? '';
 
-type FieldOption = string | { value: string; label: string };
-
-const normalizeOption = (option: FieldOption) =>
-  typeof option === 'string' ? { value: option, label: option } : option;
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('scenes');
@@ -1434,7 +1291,7 @@ const getCommandDisplayTitle = (command: CommandDefinition) => {
 
       {tab === 'commands' && (
         <div className="layout">
-          <StageProgressBar status={guidanceState.stageStatus} />
+          <StageProgressBar status={guidanceState.stageStatus} labels={stageLabels} />
           <div className="filter-bar">
             <div className="filter-group">
               <span className="filter-label">阶段</span>
@@ -1524,262 +1381,81 @@ const getCommandDisplayTitle = (command: CommandDefinition) => {
       )}
 
       {tab === 'generator' && selectedCommand && (
-        <div className="layout generator-layout">
-          <div className="generator-guidance">
-            <StageProgressBar status={guidanceState.stageStatus} />
-            <GuardrailBanner
-              visible={guardrailVisible}
-              onContinue={() => setGuardrailVisible(false)}
-              onSwitch={() => {
-                setGuardrailVisible(false);
-                if (guardrailRecommendation?.command) {
-                  selectCommandWithGuardrail(guardrailRecommendation.command, true);
-                }
-              }}
-            />
-          </div>
-          <section className="generator-inputs">
-            <div className="panel-stack">
-              {feedbackMessage && (
-                <div className="success-notice" role="status" aria-live="polite">
-                  {feedbackMessage}
-                </div>
-              )}
-              {draftRestored && <div className="draft-notice">已恢复上次草稿</div>}
-              {workflowSuggestion && <div className="suggestion-notice">{workflowSuggestion}</div>}
-              <div className="panel-card">
-                <div className="panel-title">命令</div>
-                <div className="command-title">{selectedCommand.displayName}</div>
-                <div className="required-checklist">
-                  <div className="panel-title">必填检查</div>
-                  <div className="checklist-items">
-                    {checklistItems.map((item) => {
-                      const content = (
-                        <>
-                          <span className={`checklist-dot ${item.complete ? 'done' : 'todo'}`} />
-                          <span className="checklist-label">{item.label}</span>
-                          <span className={`checklist-status ${item.complete ? 'done' : 'todo'}`}>
-                            {item.complete ? '已完成' : '缺失'}
-                          </span>
-                        </>
-                      );
-                      if (item.sectionId) {
-                        return (
-                          <a key={item.id} className={`checklist-item ${item.complete ? 'done' : ''}`} href={`#${item.sectionId}`}>
-                            {content}
-                          </a>
-                        );
-                      }
-                      return (
-                        <div key={item.id} className={`checklist-item disabled ${item.complete ? 'done' : ''}`}>
-                          {content}
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-                <select value={selectedCommand.id} onChange={(e) => selectCommandWithGuardrail(e.target.value)} className="select">
-                  {sortedCommands.map((c) => (
-                    <option key={c.id} value={c.id}>
-                      {c.displayName}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              {basicSections.map((section) => (
-                <div key={section.key} id={`section-${section.key}`} className="panel-card">
-                  <div className="panel-title">{section.title}</div>
-                  <div className="form">
-                    {section.fields.map((f) =>
-                      renderField(f, { hideLabel: section.fields.length === 1 && section.title === f.label }),
-                    )}
-                  </div>
-                  {section.key === 'intent' && intentFeedback && (
-                    <div className={`quality-feedback ${intentFeedback.status}`}>{intentFeedback.message}</div>
-                  )}
-                  {section.key === 'context' && contextFeedback && (
-                    <div className={`quality-feedback ${contextFeedback.status}`}>{contextFeedback.message}</div>
-                  )}
-                </div>
-              ))}
-
-              <div className="advanced-toggle">
-                <button
-                  className={`section-toggle ${advancedRequiredFields.length === 0 ? 'is-muted' : ''}`}
-                  type="button"
-                  onClick={() => setShowAdvanced((prev) => !prev)}
-                >
-                  {showAdvanced
-                    ? `隐藏高级选项 · 必填 ${advancedRequiredFields.length} 项`
-                    : `高级选项 · 必填 ${advancedRequiredFields.length} 项`}
-                </button>
-              </div>
-
-              <div className={`advanced-panel ${showAdvanced ? 'open' : ''} ${missingAdvancedRequired.length > 0 ? 'needs-attention' : ''}`}>
-                <div className="advanced-inner">
-                  {advancedSections.map((section) => (
-                    <div key={section.key} id={`section-${section.key}`} className="panel-card">
-                      <div className="panel-title">{section.title}</div>
-                      <div className="form">
-                        {section.fields.map((f) =>
-                          renderField(f, { hideLabel: section.fields.length === 1 && section.title === f.label }),
-                        )}
-                      </div>
-                      {section.key === 'constraints' && constraintsFeedback && (
-                        <div className={`quality-feedback ${constraintsFeedback.status}`}>{constraintsFeedback.message}</div>
-                      )}
-                    </div>
-                  ))}
-
-                  <div className="panel-card">
-                    <div className="panel-title">附件</div>
-                    <label className="btn secondary file-picker">
-                      选择文件
-                      <input type="file" multiple className="file-input" onChange={(e) => handleFileUpload(e.target.files)} />
-                    </label>
-                    <div className="muted small">仅路径/片段/全文插入；片段默认前 2000 字符。</div>
-                    <div className="inline-actions">
-                      <select value={attachmentTarget} onChange={(e) => setAttachmentTarget(e.target.value)} className="select">
-                        {attachableFields.map((f) => (
-                          <option key={f.id} value={f.id}>
-                            插入到：{f.label}
-                          </option>
-                        ))}
-                      </select>
-                      <select
-                        value={attachmentMode}
-                        onChange={(e) => setAttachmentMode(e.target.value as 'path' | 'snippet' | 'full')}
-                        className="select"
-                      >
-                        <option value="path">仅路径</option>
-                        <option value="snippet">片段</option>
-                        <option value="full">全文</option>
-                      </select>
-                    </div>
-                    <div className="attachment-list">
-                      {attachments.map((a) => (
-                        <button key={a.name} className="pill" onClick={() => removeAttachment(a.name)}>
-                          {a.name} ×
-                        </button>
-                      ))}
-                    </div>
-                    {attachments.length > 0 && (
-                    <button className="btn tertiary" onClick={() => insertAttachmentsToField(attachmentTarget, attachmentMode)}>
-                      插入到字段
-                    </button>
-                    )}
-                  </div>
-                </div>
-              </div>
-
-              {showNextCard && nextRecommendation && (
-                <NextStepCard
-                  recommendation={nextRecommendation}
-                  onUse={() => {
-                    setShowNextCard(false);
-                    selectCommandWithGuardrail(nextRecommendation.command, true);
-                  }}
-                  onBrowse={() => {
-                    setShowNextCard(false);
-                    setTab('commands');
-                  }}
-                />
-              )}
-
-              <div className="panel-card">
-                <div className="panel-title">变量</div>
-                <div className="inline-actions">
-                  <input
-                    className="input"
-                    placeholder="变量名"
-                    value={newVarKey}
-                    onChange={(e) => setNewVarKey(e.target.value)}
-                  />
-                  <input className="input" placeholder="变量值" value={newVarValue} onChange={(e) => setNewVarValue(e.target.value)} />
-                  <button className="btn secondary" onClick={addVariable}>
-                    添加变量
-                  </button>
-                </div>
-                {Object.keys(variables).length > 0 && (
-                  <div className="muted small">
-                    当前变量 <code>{Object.entries(variables).map(([k, v]) => `${k}=${v}`).join(' | ')}</code>
-                  </div>
-                )}
-              </div>
-            </div>
-            <div className="panel-card actions-panel">
-              <div className="panel-title actions-kicker">下一步</div>
-              <div className="actions-title">生成并保存</div>
-              <div className="actions-subtitle">生成最终命令文本，可复制或导出。</div>
-              <div className="inline-actions">
-                <button className="btn primary" disabled={!canGenerate} onClick={handleAddHistory}>
-                  生成并保存
-                </button>
-                <button className="btn secondary" disabled={!canGenerate} onClick={() => copyText(previewText)}>
-                  复制命令
-                </button>
-                <button className="btn secondary" onClick={() => handleSingleExport('md', supportsSave ? 'save' : 'download')}>
-                  <Icon name="export" /> 保存 .md
-                </button>
-                <button className="btn ghost" onClick={() => handleSingleExport('txt', 'download')}>
-                  <Icon name="download" /> 下载 .txt
-                </button>
-                <button className="btn ghost" onClick={() => handleSingleExport('json', 'download')}>
-                  <Icon name="download" /> 下载 .json
-                </button>
-                {supportsShare && (
-                  <button className="btn ghost" onClick={() => handleSingleExport('txt', 'share')}>
-                    <Icon name="share" /> 分享
-                  </button>
-                )}
-              </div>
-              {missingRequired.length > 0 && (
-                <div className="muted small">缺少必填字段：{missingRequired.map((f) => f.label).join('、')}</div>
-              )}
-              {missingVars.length > 0 && (
-                <div className="muted small">
-                  缺少变量 <code>{missingVars.join(', ')}</code>
-                </div>
-              )}
-              {draftSavedAt && <div className="muted small">草稿已自动保存：{formatDate(draftSavedAt)}。</div>}
-            </div>
-          </section>
-
-          <section className="generator-preview">
-            <div className="preview-panel">
-              <div className="preview-header">
-                <h3>预览</h3>
-                <div className="preview-toolbar">
-                  <button className="btn ghost" onClick={restoreUndoSnapshot} disabled={!undoSnapshot}>
-                    撤销
-                  </button>
-                  {previewOverride !== null && (
-                    <button className="btn ghost" onClick={() => setPreviewOverride(null)}>
-                      重置预览
-                    </button>
-                  )}
-                </div>
-              </div>
-              <div className="preview-surface">
-                <div className="muted small preview-note">此处编辑仅影响输出，不会回写输入字段。</div>
-                <textarea
-                  className="preview"
-                  value={previewText}
-                  onChange={(e) => setPreviewOverride(e.target.value)}
-                  placeholder="可直接编辑预览内容（不回写表单）"
-                />
-              </div>
-              <div className="muted small">
-                缺失变量将显示为 <code>&lt;&lt;MISSING:var&gt;&gt;</code>，必填字段缺失会阻断“生成并保存”。
-              </div>
-            </div>
-          </section>
-        </div>
+        <GeneratorPanel
+          guidanceStatus={guidanceState.stageStatus}
+          stageLabels={stageLabels}
+          guardrailVisible={guardrailVisible}
+          onGuardrailContinue={() => setGuardrailVisible(false)}
+          onGuardrailSwitch={() => {
+            setGuardrailVisible(false);
+            if (guardrailRecommendation?.command) {
+              selectCommandWithGuardrail(guardrailRecommendation.command, true);
+            }
+          }}
+          feedbackMessage={feedbackMessage}
+          draftRestored={draftRestored}
+          workflowSuggestion={workflowSuggestion}
+          selectedCommand={selectedCommand}
+          checklistItems={checklistItems}
+          sortedCommands={sortedCommands}
+          onSelectCommand={selectCommandWithGuardrail}
+          basicSections={basicSections}
+          advancedSections={advancedSections}
+          renderField={renderField}
+          intentFeedback={intentFeedback}
+          contextFeedback={contextFeedback}
+          constraintsFeedback={constraintsFeedback}
+          advancedRequiredFields={advancedRequiredFields}
+          missingAdvancedRequired={missingAdvancedRequired}
+          showAdvanced={showAdvanced}
+          onToggleAdvanced={() => setShowAdvanced((prev) => !prev)}
+          handleFileUpload={handleFileUpload}
+          attachmentTarget={attachmentTarget}
+          setAttachmentTarget={setAttachmentTarget}
+          attachableFields={attachableFields}
+          attachmentMode={attachmentMode}
+          setAttachmentMode={setAttachmentMode}
+          attachments={attachments}
+          removeAttachment={removeAttachment}
+          insertAttachmentsToField={insertAttachmentsToField}
+          showNextCard={showNextCard}
+          nextRecommendation={nextRecommendation}
+          onUseNextRecommendation={() => {
+            setShowNextCard(false);
+            if (nextRecommendation) {
+              selectCommandWithGuardrail(nextRecommendation.command, true);
+            }
+          }}
+          onBrowseNextRecommendation={() => {
+            setShowNextCard(false);
+            setTab('commands');
+          }}
+          newVarKey={newVarKey}
+          setNewVarKey={setNewVarKey}
+          newVarValue={newVarValue}
+          setNewVarValue={setNewVarValue}
+          addVariable={addVariable}
+          variables={variables}
+          canGenerate={canGenerate}
+          handleAddHistory={handleAddHistory}
+          copyText={copyText}
+          previewText={previewText}
+          handleSingleExport={handleSingleExport}
+          supportsSave={supportsSave}
+          supportsShare={supportsShare}
+          missingRequired={missingRequired}
+          missingVars={missingVars}
+          draftSavedAt={draftSavedAt}
+          formatDate={formatDate}
+          hasUndoSnapshot={Boolean(undoSnapshot)}
+          restoreUndoSnapshot={restoreUndoSnapshot}
+          previewOverride={previewOverride}
+          setPreviewOverride={setPreviewOverride}
+        />
       )}
       {tab === 'workflows' && (
         <div className="layout">
-          <StageProgressBar status={guidanceState.stageStatus} />
+          <StageProgressBar status={guidanceState.stageStatus} labels={stageLabels} />
           <section>
             <h3>工作流模板</h3>
             <div className="card-grid">
@@ -1830,414 +1506,74 @@ const getCommandDisplayTitle = (command: CommandDefinition) => {
       )}
 
       {tab === 'workflow-run' && activeWorkflow && currentStep && workflowCommand && workflowFormState && (
-        <div className="layout workflow-layout">
-          <div className="panel-card workflow-hero">
-            <div className="workflow-hero-main">
-              <div className="panel-title">工作流概览</div>
-              <div className="workflow-hero-title">{activeWorkflow.title}</div>
-              <div className="workflow-hero-subtitle">
-                {activeWorkflow.description ?? activeWorkflow.intendedScenario ?? '按步骤完成工作流并保持输出一致。'}
-              </div>
-              {(activeWorkflow.intendedScenario || workflowOptionalLabels.length > 0) && (
-                <div className="workflow-guidance">
-                  {activeWorkflow.intendedScenario && (
-                    <div className="workflow-guidance-line">
-                      适用场景：{activeWorkflow.intendedScenario}
-                    </div>
-                  )}
-                  {workflowOptionalLabels.length > 0 && (
-                    <div className="workflow-guidance-line">
-                      高阶用户常跳过：<code>{workflowOptionalLabels.join('、')}</code>
-                    </div>
-                  )}
-                </div>
-              )}
-              <div className="workflow-hero-tags">
-                {activeWorkflow.audience && (
-                  <span className="badge">{activeWorkflow.audience === 'new user' ? '适合新手' : '适合高阶用户'}</span>
-                )}
-                {currentStep.optional && <span className="badge optional">可选</span>}
-                <span className="badge">{stageLabels[workflowCommand.stage]}</span>
-              </div>
-            </div>
-            <div className="workflow-hero-progress">
-              <div className="workflow-progress-header">
-                <div className="panel-title">进度</div>
-                <div className="workflow-progress-count">
-                  {workflowCurrentNumber}/{workflowStepTotal}
-                </div>
-              </div>
-              <div className="workflow-progress-bar">
-                <span style={{ width: `${workflowProgressPercent}%` }} />
-              </div>
-              <div className="workflow-progress-meta">
-                已完成 {workflowCompletedCount} · 已跳过 {workflowSkippedCount} · 剩余 {workflowRemainingCount}
-              </div>
-              <div className="workflow-next-panel">
-                <div className="panel-title">下一步</div>
-                {workflowNextStep ? (
-                  <div className="workflow-next-step">
-                    <div className="workflow-next-title">
-                      {workflowCurrentNumber + 1}. {workflowNextCommand?.displayName ?? workflowNextStep.commandId}
-                    </div>
-                    <div className="workflow-next-meta">
-                      {workflowNextStep.optional && <span className="badge optional">可选</span>}
-                      {workflowNextCommand && <span className="badge">{stageLabels[workflowNextCommand.stage]}</span>}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="muted small">已进入最后一步，完成即可结束工作流。</div>
-                )}
-              </div>
-            </div>
-          </div>
-
-          {feedbackMessage && (
-            <div className="success-notice workflow-feedback" role="status" aria-live="polite">
-              {feedbackMessage}
-            </div>
-          )}
-
-          <div className="workflow-columns">
-            <section className="workflow-rail">
-              <div className="panel-card journey-panel">
-                <div className="panel-title">流程地图</div>
-                <div className="journey-steps">
-                  {activeWorkflow.steps.map((step, idx) => {
-                    const status = workflowStepStatus[step.stepId] ?? 'pending';
-                    const isCurrent = idx === workflowStepIndex;
-                    const command = commandLookup.get(step.commandId);
-                    const label = command?.displayName ?? step.commandId;
-                    const statusKey = status === 'done' || status === 'skipped' ? status : isCurrent ? 'current' : 'todo';
-                    const statusLabel = status === 'done' ? '已完成' : status === 'skipped' ? '已跳过' : isCurrent ? '进行中' : '待处理';
-                    const statusClass = status === 'done' ? 'done' : status === 'skipped' ? 'skipped' : isCurrent ? 'current' : 'upcoming';
-                    return (
-                      <button
-                        key={step.stepId}
-                        className={`journey-step ${statusClass} ${step.optional ? 'optional' : ''}`}
-                        onClick={() => moveToWorkflowStep(idx)}
-                      >
-                        <div className="journey-step-index">{idx + 1}</div>
-                        <div className="journey-step-body">
-                          <div className="journey-step-title">
-                            {command ? `${stageLabels[command.stage]} · ${label}` : label}
-                            {step.optional && <span className="badge optional">可选</span>}
-                          </div>
-                          <div className="journey-step-meta">
-                            <span className={`badge status-${statusKey}`}>{statusLabel}</span>
-                            {command && <span className="badge">{stageLabels[command.stage]}</span>}
-                            {step.optional && <span className="journey-step-note muted small">跳过后仍可继续工作流。</span>}
-                          </div>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-                <div className="divider" />
-                <div className="inline-actions">
-                  <button
-                    className="btn ghost"
-                    onClick={() => moveToWorkflowStep(workflowStepIndex - 1)}
-                    disabled={workflowStepIndex === 0}
-                  >
-                    上一步
-                  </button>
-                  <button
-                    className="btn ghost"
-                    onClick={() => moveToWorkflowStep(workflowStepIndex + 1)}
-                    disabled={workflowStepIndex >= workflowStepTotal - 1}
-                  >
-                    下一步
-                  </button>
-                </div>
-                <button className="btn ghost" onClick={handleWorkflowReset}>
-                  退出工作流
-                </button>
-              </div>
-
-              <div className="panel-card">
-                <div className="panel-title">变量</div>
-                <div className="inline-actions">
-                  <input className="input" placeholder="变量名" value={workflowVarKey} onChange={(e) => setWorkflowVarKey(e.target.value)} />
-                  <input className="input" placeholder="变量值" value={workflowVarValue} onChange={(e) => setWorkflowVarValue(e.target.value)} />
-                  <button className="btn secondary" onClick={addWorkflowVariable}>
-                    添加
-                  </button>
-                </div>
-                {Object.keys(workflowVariables).length > 0 && (
-                  <div className="muted small">
-                    当前变量 <code>{Object.entries(workflowVariables).map(([k, v]) => `${k}=${v}`).join(' | ')}</code>
-                  </div>
-                )}
-              </div>
-            </section>
-
-            <section className="workflow-main">
-              <div className="panel-card">
-                <div className="panel-title">当前步骤</div>
-                <div className="command-title">{workflowCommand.displayName}</div>
-                <div className="muted small">{workflowStepFraming}</div>
-                <div className="workflow-step-meta">
-                  <span
-                    className={`badge status-${workflowCurrentStatus === 'pending' ? 'current' : workflowCurrentStatus}`}
-                  >
-                    {workflowCurrentStatus === 'done' ? '已完成' : workflowCurrentStatus === 'skipped' ? '已跳过' : '进行中'}
-                  </span>
-                  {currentStep.optional && <span className="badge optional">可选</span>}
-                  <span className="badge">{stageLabels[workflowCommand.stage]}</span>
-                </div>
-                <div className="muted small">
-                  步骤 {workflowCurrentNumber} / {workflowStepTotal}
-                </div>
-                {currentStep.optional && (
-                  <div className="muted small">可选步骤，跳过不会阻断工作流。</div>
-                )}
-              </div>
-
-              <div className="panel-card" id="workflow-inputs">
-                <div className="panel-title">输入</div>
-                <div className="form">
-                  {workflowCommand.fields.map((f) => {
-                    const inputId = `workflow-${currentStep?.stepId ?? 'step'}-${f.id}`;
-                    return (
-                      <div key={f.id} className="field">
-                        <label htmlFor={inputId}>
-                          {f.label}
-                          {f.required && <span className="required">*</span>}
-                        </label>
-                        {f.type === 'select' ? (
-                          <select
-                            id={inputId}
-                            value={String(workflowFormState[f.id] ?? '')}
-                            onChange={(e) => updateWorkflowField(f.id, e.target.value)}
-                            className="input"
-                          >
-                            {(f.options ?? []).map((option) => {
-                              const normalized = normalizeOption(option);
-                              return (
-                                <option key={normalized.value} value={normalized.value}>
-                                  {normalized.label}
-                                </option>
-                              );
-                            })}
-                          </select>
-                        ) : f.type === 'boolean' ? (
-                          <input
-                            id={inputId}
-                            aria-label={f.label}
-                            type="checkbox"
-                            checked={Boolean(workflowFormState[f.id])}
-                            onChange={(e) => updateWorkflowField(f.id, e.target.checked)}
-                          />
-                        ) : f.type === 'path' ? (
-                          <div className="input-row">
-                            <input
-                              id={inputId}
-                              className="input"
-                              value={(workflowFormState[f.id] as string) ?? ''}
-                              placeholder="选择或输入路径"
-                              onChange={(e) => updateWorkflowField(f.id, e.target.value)}
-                            />
-                            <button
-                              className="btn secondary"
-                              type="button"
-                              disabled={!supportsDirectoryPicker}
-                              onClick={() => pickDirectory((value) => updateWorkflowField(f.id, value))}
-                            >
-                              <Icon name="folder" /> 选文件夹
-                            </button>
-                          </div>
-                        ) : f.type === 'list' ? (
-                          <>
-                            <textarea
-                              id={inputId}
-                              className="input"
-                              rows={3}
-                              placeholder="每行一项"
-                              value={(workflowFormState[f.id] as string[] | undefined)?.join('\n') ?? ''}
-                              onChange={(e) => updateWorkflowList(f.id, e.target.value)}
-                            />
-                            <button className="btn danger" type="button" onClick={() => clearWorkflowFieldValue(f.id, f.type)}>
-                              <Icon name="trash" /> 清空多行内容
-                            </button>
-                          </>
-                        ) : (
-                          <>
-                            <textarea
-                              id={inputId}
-                              className="input"
-                              rows={f.type === 'text' ? 2 : 4}
-                              value={(workflowFormState[f.id] as string) ?? ''}
-                              onChange={(e) => updateWorkflowField(f.id, e.target.value)}
-                            />
-                            {f.type === 'multiline' && (
-                              <button className="btn danger" type="button" onClick={() => clearWorkflowFieldValue(f.id, f.type)}>
-                                <Icon name="trash" /> 清空多行内容
-                              </button>
-                            )}
-                          </>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="panel-card actions-panel">
-                <div className="panel-title actions-kicker">操作</div>
-                <div className="actions-title">
-                  {workflowCurrentStatus === 'done' && workflowNextStep ? '继续' : '生成本步输出'}
-                </div>
-                <div className="actions-subtitle">
-                  {workflowCurrentStatus === 'done' && workflowNextStep
-                    ? '准备好后进入下一步。'
-                    : workflowCurrentStatus === 'done'
-                      ? '该工作流已全部完成。'
-                      : '请先生成并保存本步输出，再继续。'}
-                </div>
-                <div className="inline-actions">
-                  {workflowCurrentStatus === 'done' && workflowNextStep ? (
-                    <button className="btn primary" onClick={() => moveToWorkflowStep(workflowStepIndex + 1)}>
-                      进入下一步
-                    </button>
-                  ) : (
-                    <button className="btn primary" disabled={!canGenerateWorkflowStep} onClick={handleWorkflowGenerate}>
-                      生成本步输出
-                    </button>
-                  )}
-                  <button className="btn secondary" onClick={() => scrollToWorkflowSection('workflow-inputs')}>
-                    编辑输入
-                  </button>
-                  <button className="btn secondary" onClick={showWorkflowSavedOutput} disabled={!workflowHasSavedOutput}>
-                    查看上次输出
-                  </button>
-                  <button className="btn ghost" onClick={handleWorkflowSkip}>
-                    跳过步骤
-                  </button>
-                </div>
-                {workflowMissingRequired.length > 0 && (
-                  <div className="muted small">缺少必填字段：{workflowMissingRequired.map((f) => f.label).join('、')}</div>
-                )}
-                {workflowMissingVars.length > 0 && (
-                  <div className="muted small">
-                    缺少变量 <code>{workflowMissingVars.join(', ')}</code>
-                  </div>
-                )}
-              </div>
-
-              <div className="panel-card">
-                <div className="panel-title">附件</div>
-                <label className="btn secondary file-picker">
-                  选择文件
-                  <input type="file" multiple className="file-input" onChange={(e) => handleWorkflowFileUpload(e.target.files)} />
-                </label>
-                <div className="inline-actions">
-                  <select value={workflowAttachmentTarget} onChange={(e) => setWorkflowAttachmentTarget(e.target.value)} className="select">
-                    {workflowCommand.fields
-                      .filter((f) => f.type !== 'select' && f.type !== 'boolean')
-                      .map((f) => (
-                        <option key={f.id} value={f.id}>
-                          插入到：{f.label}
-                        </option>
-                      ))}
-                  </select>
-                  <select
-                    value={workflowAttachmentMode}
-                    onChange={(e) => setWorkflowAttachmentMode(e.target.value as 'path' | 'snippet' | 'full')}
-                    className="select"
-                  >
-                    <option value="path">仅路径</option>
-                    <option value="snippet">片段</option>
-                    <option value="full">全文</option>
-                  </select>
-                </div>
-                <div className="attachment-list">
-                  {workflowAttachmentsList.map((a) => (
-                    <div key={a.name} className="pill">
-                      {a.name}
-                    </div>
-                  ))}
-                </div>
-                {workflowAttachmentsList.length > 0 && (
-                  <button className="btn tertiary" onClick={() => insertWorkflowAttachments(workflowAttachmentTarget, workflowAttachmentMode)}>
-                    插入到字段
-                  </button>
-                )}
-              </div>
-            </section>
-
-            <section className="workflow-preview" id="workflow-preview">
-              <div className="preview-panel">
-                <div className="preview-header">
-                  <h3>预览与输出</h3>
-                  <div className="preview-toolbar">
-                    <button className="btn secondary" onClick={() => handleWorkflowExport('md', supportsSave ? 'save' : 'download')}>
-                      <Icon name="export" /> 保存 .md
-                    </button>
-                    <button className="btn ghost" onClick={() => handleWorkflowExport('txt', 'download')}>
-                      <Icon name="download" /> 下载 .txt
-                    </button>
-                    {supportsShare && (
-                      <button className="btn ghost" onClick={() => handleWorkflowExport('txt', 'share')}>
-                        <Icon name="share" /> 分享
-                      </button>
-                    )}
-                  </div>
-                </div>
-                <div className="preview-surface">
-                  <div className="muted small preview-note">此处编辑仅影响输出，不会回写输入字段。</div>
-                  <textarea
-                    className="preview"
-                    value={workflowPreviewText}
-                    onChange={(e) => setWorkflowPreviewOverrides((prev) => ({ ...prev, [currentStep.stepId]: e.target.value }))}
-                    placeholder="可直接编辑预览内容（不回写表单）"
-                  />
-                </div>
-              </div>
-            </section>
-          </div>
-        </div>
+        <WorkflowRunPanel
+          activeWorkflow={activeWorkflow}
+          currentStep={currentStep}
+          workflowCommand={workflowCommand}
+          workflowFormState={workflowFormState}
+          workflowOptionalLabels={workflowOptionalLabels}
+          stageLabels={stageLabels}
+          workflowCurrentNumber={workflowCurrentNumber}
+          workflowStepTotal={workflowStepTotal}
+          workflowProgressPercent={workflowProgressPercent}
+          workflowCompletedCount={workflowCompletedCount}
+          workflowSkippedCount={workflowSkippedCount}
+          workflowRemainingCount={workflowRemainingCount}
+          workflowNextStep={workflowNextStep}
+          workflowNextCommand={workflowNextCommand}
+          feedbackMessage={feedbackMessage}
+          workflowStepStatus={workflowStepStatus}
+          workflowStepIndex={workflowStepIndex}
+          getCommand={(commandId) => commandLookup.get(commandId) ?? null}
+          moveToWorkflowStep={moveToWorkflowStep}
+          handleWorkflowReset={handleWorkflowReset}
+          workflowVarKey={workflowVarKey}
+          setWorkflowVarKey={setWorkflowVarKey}
+          workflowVarValue={workflowVarValue}
+          setWorkflowVarValue={setWorkflowVarValue}
+          addWorkflowVariable={addWorkflowVariable}
+          workflowVariables={workflowVariables}
+          workflowStepFraming={workflowStepFraming}
+          workflowCurrentStatus={workflowCurrentStatus}
+          supportsDirectoryPicker={supportsDirectoryPicker}
+          pickDirectory={pickDirectory}
+          updateWorkflowField={updateWorkflowField}
+          updateWorkflowList={updateWorkflowList}
+          clearWorkflowFieldValue={clearWorkflowFieldValue}
+          canGenerateWorkflowStep={canGenerateWorkflowStep}
+          handleWorkflowGenerate={handleWorkflowGenerate}
+          scrollToWorkflowSection={scrollToWorkflowSection}
+          showWorkflowSavedOutput={showWorkflowSavedOutput}
+          workflowHasSavedOutput={workflowHasSavedOutput}
+          handleWorkflowSkip={handleWorkflowSkip}
+          workflowMissingRequired={workflowMissingRequired}
+          workflowMissingVars={workflowMissingVars}
+          handleWorkflowFileUpload={handleWorkflowFileUpload}
+          workflowAttachmentTarget={workflowAttachmentTarget}
+          setWorkflowAttachmentTarget={setWorkflowAttachmentTarget}
+          workflowAttachmentMode={workflowAttachmentMode}
+          setWorkflowAttachmentMode={setWorkflowAttachmentMode}
+          workflowAttachmentsList={workflowAttachmentsList}
+          insertWorkflowAttachments={insertWorkflowAttachments}
+          supportsSave={supportsSave}
+          supportsShare={supportsShare}
+          handleWorkflowExport={handleWorkflowExport}
+          workflowPreviewText={workflowPreviewText}
+          setWorkflowPreviewOverrides={setWorkflowPreviewOverrides}
+        />
       )}
       {tab === 'history' && (
-        <div className="layout">
-          <section>
-            <h3>历史记录</h3>
-            <div className="card-grid">
-              {history.length === 0 && <div className="muted">暂无历史</div>}
-              {history.map((h) => {
-                const commandLabel = commandLookup.get(h.commandId)?.displayName ?? h.commandId;
-                return (
-                <div key={h.id} className="card history-card">
-                  <div className="card-title">
-                    <code>{commandLabel}</code> <span className="card-sub">{formatDate(h.createdAt)}</span>
-                  </div>
-                  <pre className="small muted code">
-                    {h.commandText.slice(0, 200)}
-                    {h.commandText.length > 200 ? '...' : ''}
-                  </pre>
-                  <div className="inline-actions history-actions">
-                    <button className="btn secondary" onClick={() => copyText(h.commandText)}>
-                      复制
-                    </button>
-                    <button
-                      className="btn ghost"
-                      onClick={() => {
-                        setFormDraft(h.fields);
-                        selectCommandWithGuardrail(h.commandId, true);
-                      }}
-                    >
-                      复用
-                    </button>
-                    <button className="btn danger" onClick={() => removeHistoryItem(h.id)}>
-                      删除
-                    </button>
-                  </div>
-                </div>
-              );
-              })}
-            </div>
-          </section>
-        </div>
+        <HistoryPanel
+          history={history}
+          getCommandLabel={(commandId) => commandLookup.get(commandId)?.displayName ?? commandId}
+          formatDate={formatDate}
+          copyText={copyText}
+          onReuse={(entry) => {
+            setFormDraft(entry.fields);
+            selectCommandWithGuardrail(entry.commandId, true);
+          }}
+          onRemove={removeHistoryItem}
+        />
       )}
     </div>
   );
