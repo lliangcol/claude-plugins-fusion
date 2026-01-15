@@ -142,7 +142,6 @@ The repo includes 69 sub-agent definitions across engineering, data, architectur
 |--------|--------|-----------|
 | [📘 Command Reference Guide](nova-plugin/docs/commands-reference-guide.md) | Full parameters, 5+ scenarios, workflow templates | **Daily lookup, copy templates** |
 | [📗 Command Handbook](nova-plugin/docs/claude-code-commands-handbook.md) | Grouped by type, command comparison | **Quick start, pick a command** |
-| [🧰 Command Generator Spec (CN)](nova-plugin/docs/command-generator-requirements.md) | Requirements, workflows, and metadata model for a command generator | **Generate commands, chain workflows** |
 | [🧠 Agents Summary](nova-plugin/docs/agents-summary.en.md) | Agent roles, tools, and scenarios | **Understand and pick agents** |
 
 For the Chinese version, see `README.md` and `nova-plugin/docs/agents-summary.md`.

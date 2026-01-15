@@ -2,7 +2,7 @@
 
 本目录用于存放“命令生成器（Command Generator）”的设计草图与结构化说明，作为后续 `/produce-plan`、实现与测试的输入材料。
 
-- 需求文档：`nova-plugin/docs/command-generator-requirements.md`
+- 需求文档：`nova-plugin/docs/command-generator-design/command-generator-requirements.md`
 - 命令来源：`nova-plugin/commands/`
 - 人类参考：`nova-plugin/docs/commands-reference-guide.md`、`nova-plugin/docs/claude-code-commands-handbook.md`
 

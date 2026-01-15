@@ -8,7 +8,7 @@
 
 本计划基于以下材料制定：
 
-- 需求：`nova-plugin/docs/command-generator-requirements.md`
+- 需求：`nova-plugin/docs/command-generator-design/command-generator-requirements.md`
 - 设计草图：`nova-plugin/docs/command-generator-design/README.md`
   - IA：`nova-plugin/docs/command-generator-design/01-sitemap.md`
   - 流程：`nova-plugin/docs/command-generator-design/02-user-flows.md`
@@ -58,8 +58,9 @@ repo/
     tests/
   nova-plugin/
     docs/
-      command-generator-implementation-plan.md
-      command-generator-requirements.md
+      command-generator-design/
+        command-generator-implementation-plan.md
+        command-generator-requirements.md
       command-generator-design/
 ```
 

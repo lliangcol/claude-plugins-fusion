@@ -16,7 +16,7 @@
 在命令行进入项目目录：
 
 ```bash
-cd D:\Work\Projects\claude-plugins-fusion\nova-plugin-command-generator
+cd .\nova-plugin-command-generator
 npm install
 ```
 
@@ -107,6 +107,6 @@ npm run preview
 
 ## 5. 入口与资料索引
 
-- 需求文档：`nova-plugin/docs/command-generator-requirements.md`
+- 需求文档：`nova-plugin/docs/command-generator-design/command-generator-requirements.md`
 - 设计草图：`nova-plugin/docs/command-generator-design/README.md`
-- 实现计划：`nova-plugin/docs/command-generator-implementation-plan.md`
+- 实现计划：`nova-plugin/docs/command-generator-design/command-generator-implementation-plan.md`

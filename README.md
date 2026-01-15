@@ -142,7 +142,6 @@ llm-plugins-fusion/
 |--------|--------|-----------|
 | [📘 命令完全参考手册](nova-plugin/docs/commands-reference-guide.md) | 详细参数、5+ 场景示例、工作流模板 | **日常查询、复制模板** |
 | [📗 命令使用手册](nova-plugin/docs/claude-code-commands-handbook.md) | 按类型组织、命令对比表 | **快速入门、命令选择** |
-| [🧰 命令生成器需求方案设计](nova-plugin/docs/command-generator-requirements.md) | 命令生成软件需求、工作流与元数据模型设计 | **命令生成面板、工作流串联** |
 | [🧠 Agents 子代理说明](nova-plugin/docs/agents-summary.md) | 子代理角色、工具、场景汇总 | **了解与选择子代理** |
 
 如需英文文档，请见 `nova-plugin/docs/README.en.md` 与 `nova-plugin/docs/agents-summary.en.md`。
