@@ -1,9 +1,24 @@
 ﻿
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { manifest } from './data/manifest';
-import { Attachment, CommandDefinition, FormState, HistoryEntry, ScenarioDefinition } from './types';
+import {
+  Attachment,
+  CommandDefinition,
+  FieldDefinition,
+  FormState,
+  GuidanceRecommendation,
+  GuidanceState,
+  HistoryEntry,
+  ScenarioDefinition,
+  StageKey,
+  StageStatus,
+} from './types';
 import { addHistory, loadHistory, saveHistory } from './store/history';
+import { loadGuidanceState, recordGuidanceSuccess } from './store/guidance';
+import { loadDraft, saveDraft } from './store/draft';
 import { renderTemplate, stageOrder, constraintLabel, constraintOrder } from './utils/render';
+import { evaluateConstraints, evaluateContext, evaluateIntent, QualityFeedback } from './utils/promptQuality';
+import { buildCommandStageMap, recommendNext, stageFlow } from './utils/guidance';
 
 type Tab = 'scenes' | 'commands' | 'generator' | 'workflows' | 'workflow-run' | 'history';
 
@@ -82,6 +97,11 @@ const icons = {
       <path d="M8 11l8-4M8 13l8 4" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   ),
+  check: (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M5 12l4 4L19 6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  ),
 };
 
 type IconName = keyof typeof icons;
@@ -89,6 +109,72 @@ type IconName = keyof typeof icons;
 const Icon = ({ name, className }: { name: IconName; className?: string }) => (
   <span className={className ?? 'icon'}>{icons[name]}</span>
 );
+
+const StageProgressBar = ({ status }: { status: Record<StageKey, StageStatus> }) => (
+  <div className="stage-progress">
+    {stageFlow.map((stage) => {
+      const state = status[stage] ?? 'todo';
+      return (
+        <div key={stage} className={`stage-item ${state}`}>
+          {state === 'done' && <Icon name="check" className="stage-icon" />}
+          <span className="stage-label">{stageLabels[stage]}</span>
+        </div>
+      );
+    })}
+  </div>
+);
+
+const NextStepCard = ({
+  recommendation,
+  onUse,
+  onBrowse,
+}: {
+  recommendation: GuidanceRecommendation;
+  onUse: () => void;
+  onBrowse: () => void;
+}) => (
+  <div className="next-step-card">
+    <div className="panel-title">下一步建议</div>
+    <div className="next-step-body">{recommendation.reason}</div>
+    <div className="next-step-actions">
+      <button className="btn secondary" onClick={onUse}>
+        使用 {recommendation.command}
+      </button>
+      <button className="btn ghost" onClick={onBrowse}>
+        查看其它命令
+      </button>
+    </div>
+  </div>
+);
+
+const GuardrailBanner = ({
+  visible,
+  onContinue,
+  onSwitch,
+}: {
+  visible: boolean;
+  onContinue: () => void;
+  onSwitch: () => void;
+}) =>
+  visible ? (
+    <div className="guardrail-banner">
+      <div className="guardrail-icon">
+        <Icon name="steps" />
+      </div>
+      <div className="guardrail-content">
+        <div className="guardrail-title">建议先完成 Plan / Review</div>
+        <div className="guardrail-body">这样可以降低返工风险并提升输出质量。</div>
+      </div>
+      <div className="guardrail-actions">
+      <button className="btn secondary" onClick={onContinue}>
+        继续执行
+      </button>
+        <button className="btn ghost" onClick={onSwitch}>
+          切换到推荐步骤
+        </button>
+      </div>
+    </div>
+  ) : null;
 
 const initForm = (cmd: CommandDefinition): FormState =>
   cmd.fields.reduce<FormState>((acc, f) => {
@@ -115,19 +201,43 @@ const getDefaultAttachmentTarget = (cmd: CommandDefinition) =>
   cmd.fields.find((f) => f.id === 'CONTEXT')?.id ?? cmd.fields[0]?.id ?? '';
 
 export default function App() {
-  const firstCommand = manifest.commands[0];
   const [tab, setTab] = useState<Tab>('scenes');
-  const [selectedCommandId, setSelectedCommandId] = useState<string>(firstCommand?.id ?? '');
-  const [formState, setFormState] = useState<FormState>(firstCommand ? initForm(firstCommand) : {});
+  const [selectedCommandId, setSelectedCommandId] = useState<string>('');
+  const [formState, setFormState] = useState<FormState>({});
   const [formDraft, setFormDraft] = useState<FormState | null>(null);
   const [variables, setVariables] = useState<Record<string, string>>({});
   const [history, setHistory] = useState<HistoryEntry[]>(loadHistory());
+  const [guidanceState, setGuidanceState] = useState<GuidanceState>(() => loadGuidanceState());
+  const [nextRecommendation, setNextRecommendation] = useState<GuidanceRecommendation | null>(null);
+  const [showNextCard, setShowNextCard] = useState(false);
+  const [guardrailVisible, setGuardrailVisible] = useState(false);
+  const [draftRestored, setDraftRestored] = useState(false);
+  const [feedbackMessage, setFeedbackMessage] = useState<string | null>(null);
+  const [draftSavedAt, setDraftSavedAt] = useState<number | null>(null);
+  const [showAdvanced, setShowAdvanced] = useState(() => {
+    try {
+      return localStorage.getItem('command-generator-advanced') === 'true';
+    } catch {
+      return false;
+    }
+  });
   const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [attachmentTarget, setAttachmentTarget] = useState<string>(firstCommand ? getDefaultAttachmentTarget(firstCommand) : '');
+  const [attachmentTarget, setAttachmentTarget] = useState<string>('');
   const [attachmentMode, setAttachmentMode] = useState<'path' | 'snippet' | 'full'>('snippet');
   const [previewOverride, setPreviewOverride] = useState<string | null>(null);
   const [newVarKey, setNewVarKey] = useState('');
   const [newVarValue, setNewVarValue] = useState('');
+  const [undoSnapshot, setUndoSnapshot] = useState<{
+    selectedCommandId: string;
+    formState: FormState;
+    variables: Record<string, string>;
+    attachments: Attachment[];
+    attachmentTarget: string;
+    attachmentMode: 'path' | 'snippet' | 'full';
+    previewOverride: string | null;
+  } | null>(null);
+  const draftRestoreRef = useRef(false);
+  const feedbackTimerRef = useRef<number | null>(null);
 
   const [activeWorkflowId, setActiveWorkflowId] = useState<string | null>(null);
   const [workflowStepIndex, setWorkflowStepIndex] = useState(0);
@@ -143,14 +253,32 @@ export default function App() {
   const [workflowAttachmentMode, setWorkflowAttachmentMode] = useState<'path' | 'snippet' | 'full'>('snippet');
 
   const selectedCommand = useMemo(
-    () => manifest.commands.find((c) => c.id === selectedCommandId) ?? manifest.commands[0],
+    () => (selectedCommandId ? manifest.commands.find((c) => c.id === selectedCommandId) ?? null : null),
     [selectedCommandId],
   );
+  const commandStageMap = useMemo(() => buildCommandStageMap(manifest.commands), []);
+  const canAccessGenerator = Boolean(selectedCommandId);
+  const stageLabelMap = useMemo(() => stageLabels, []);
+  const workflowSuggestion = useMemo(() => {
+    if (!selectedCommand) return null;
+    const match = manifest.workflows.find((workflow) =>
+      workflow.steps.some((step) => step.commandId === selectedCommand.id),
+    );
+    if (!match) return null;
+    return `This command is often used as part of ${match.title}.`;
+  }, [selectedCommand]);
 
   useEffect(() => {
     if (!selectedCommand) return;
     setFormState(formDraft ?? initForm(selectedCommand));
     setFormDraft(null);
+    if (draftRestoreRef.current) {
+      draftRestoreRef.current = false;
+      if (!attachmentTarget) {
+        setAttachmentTarget(getDefaultAttachmentTarget(selectedCommand));
+      }
+      return;
+    }
     setVariables({});
     setAttachments([]);
     setPreviewOverride(null);
@@ -190,8 +318,28 @@ export default function App() {
     ? selectedCommand.fields.filter((f) => f.required && !isFieldFilled(f.id, selectedCommand, formState[f.id]))
     : [];
 
+  const showFeedback = (message: string) => {
+    setFeedbackMessage(message);
+    if (feedbackTimerRef.current) {
+      window.clearTimeout(feedbackTimerRef.current);
+    }
+    feedbackTimerRef.current = window.setTimeout(() => {
+      setFeedbackMessage(null);
+      feedbackTimerRef.current = null;
+    }, 3200);
+  };
+
   const handleAddHistory = () => {
     if (!selectedCommand) return;
+    setUndoSnapshot({
+      selectedCommandId,
+      formState: { ...formState },
+      variables: { ...variables },
+      attachments: attachments.map((attachment) => ({ ...attachment })),
+      attachmentTarget,
+      attachmentMode,
+      previewOverride,
+    });
     const entry: HistoryEntry = {
       id: `${selectedCommand.id}-${Date.now()}`,
       commandId: selectedCommand.id,
@@ -201,6 +349,11 @@ export default function App() {
     };
     const list = addHistory(entry);
     setHistory(list);
+    const nextGuidance = recordGuidanceSuccess(selectedCommand.id, selectedCommand.stage, entry.createdAt);
+    setGuidanceState(nextGuidance);
+    setNextRecommendation(recommendNext(nextGuidance, guidanceContext));
+    setShowNextCard(true);
+    showFeedback('Generated and saved to History (local storage).');
   };
 
   const handleFileUpload = async (files: FileList | null) => {
@@ -240,7 +393,7 @@ export default function App() {
     setAttachments((prev) => prev.filter((a) => a.name !== name));
   };
 
-  const exportBlob = (content: string, filename: string, type = 'text/plain') => {
+  const exportBlob = (content: string, filename: string, type = 'text/plain', feedback?: string) => {
     const blob = new Blob([content], { type });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -248,6 +401,9 @@ export default function App() {
     a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+    if (feedback) {
+      showFeedback(feedback);
+    }
   };
 
   const buildExportPayload = (cmd: CommandDefinition, fields: FormState, text: string, kind: 'md' | 'txt' | 'json') => {
@@ -267,7 +423,12 @@ export default function App() {
     if (!selectedCommand) return;
     const payload = buildExportPayload(selectedCommand, formState, previewText, kind);
     if (mode === 'download') {
-      exportBlob(payload.content, payload.filename, payload.type);
+      exportBlob(
+        payload.content,
+        payload.filename,
+        payload.type,
+        `Exported ${payload.filename} to your default downloads folder.`,
+      );
       return;
     }
     if (mode === 'save') {
@@ -284,42 +445,114 @@ export default function App() {
       const writable = await handle.createWritable();
       await writable.write(payload.content);
       await writable.close();
+      showFeedback(`Exported ${payload.filename} to the selected save location.`);
       return;
     }
     if (mode === 'share' && navigator.share) {
       try {
         await navigator.share({ title: selectedCommand.displayName, text: payload.content });
+        showFeedback('Shared via the system share sheet.');
         return;
       } catch {
-        exportBlob(payload.content, payload.filename, payload.type);
+        exportBlob(
+          payload.content,
+          payload.filename,
+          payload.type,
+          `Exported ${payload.filename} to your default downloads folder.`,
+        );
         return;
       }
     }
-    exportBlob(payload.content, payload.filename, payload.type);
+    exportBlob(
+      payload.content,
+      payload.filename,
+      payload.type,
+      `Exported ${payload.filename} to your default downloads folder.`,
+    );
+  };
+
+  const isOutOfOrder = (stage: StageKey) => {
+    const stageIndex = stageFlow.indexOf(stage);
+    if (stageIndex <= 0) return false;
+    return stageFlow.slice(0, stageIndex).some((key) => guidanceState.stageStatus[key] === 'todo');
+  };
+
+  const selectCommandWithGuardrail = (id: string, switchTab = false) => {
+    if (switchTab) setTab('generator');
+    setSelectedCommandId(id);
+    const stage = commandStageMap[id];
+    if (stage && isOutOfOrder(stage)) {
+      setGuardrailVisible(true);
+    } else {
+      setGuardrailVisible(false);
+    }
   };
 
   const setCommandAndSwitch = (id: string) => {
-    setSelectedCommandId(id);
-    setTab('generator');
+    selectCommandWithGuardrail(id, true);
+  };
+
+  const restoreUndoSnapshot = () => {
+    if (!undoSnapshot) return;
+    const isSameCommand = undoSnapshot.selectedCommandId === selectedCommandId;
+    draftRestoreRef.current = true;
+    if (isSameCommand) {
+      setFormState(undoSnapshot.formState);
+      setFormDraft(null);
+    } else {
+      setFormDraft(undoSnapshot.formState);
+    }
+    setSelectedCommandId(undoSnapshot.selectedCommandId);
+    setVariables(undoSnapshot.variables);
+    setAttachments(undoSnapshot.attachments);
+    setAttachmentTarget(undoSnapshot.attachmentTarget);
+    setAttachmentMode(undoSnapshot.attachmentMode);
+    setPreviewOverride(undoSnapshot.previewOverride);
+    setUndoSnapshot(null);
+  };
+
+  const getSceneRecommendation = (scenario: ScenarioDefinition) => {
+    if (scenario.recommendWorkflowId) {
+      return {
+        label: 'Workflow',
+        note: 'This scenario involves multiple steps, so a workflow keeps the sequence aligned.',
+      };
+    }
+    return {
+      label: 'Single Command',
+      note: 'This scenario produces a single artifact, so one command is enough.',
+    };
   };
 
   const sceneCards = (scenarios: ScenarioDefinition[]) =>
-    scenarios.map((s) => (
-      <div key={s.id} className="card">
-        <div className="card-title">{s.title}</div>
-        <div className="card-sub">{s.category}</div>
-        {s.recommendCommandId && (
-          <button className="btn" onClick={() => setCommandAndSwitch(s.recommendCommandId)}>
-            用 {s.recommendCommandId}
-          </button>
-        )}
-        {s.recommendWorkflowId && (
-          <button className="btn ghost" onClick={() => startWorkflow(s.recommendWorkflowId)}>
-            启动工作流
-          </button>
-        )}
-      </div>
-    ));
+    scenarios.map((s) => {
+      const recommendation = getSceneRecommendation(s);
+      return (
+        <div
+          key={s.id}
+          className={`card scene-card ${s.recommendCommandId || s.recommendWorkflowId ? 'recommended' : ''}`.trim()}
+        >
+          <div className="card-title">{s.title}</div>
+          <div className="card-sub">{s.category}</div>
+          <div className="scene-recommend">
+            <div className="scene-recommend-label">
+              Recommended Path <span className="badge">{recommendation.label}</span>
+            </div>
+            <div className="scene-recommend-note">{recommendation.note}</div>
+          </div>
+          {s.recommendCommandId && (
+            <button className="btn secondary" onClick={() => setCommandAndSwitch(s.recommendCommandId)}>
+              用 {s.recommendCommandId}
+            </button>
+          )}
+          {s.recommendWorkflowId && (
+            <button className="btn secondary" onClick={() => startWorkflow(s.recommendWorkflowId)}>
+              启动工作流
+            </button>
+          )}
+        </div>
+      );
+    });
 
   const sortedCommands = useMemo(
     () =>
@@ -345,7 +578,48 @@ export default function App() {
     ? selectedCommand.fields.filter((f) => f.type !== 'select' && f.type !== 'boolean')
     : [];
 
+  useEffect(() => {
+    const draft = loadDraft();
+    if (!draft) return;
+    draftRestoreRef.current = true;
+    setFormDraft(draft.formState);
+    setSelectedCommandId(draft.selectedCommandId);
+    setVariables(draft.variables ?? {});
+    setAttachments(draft.attachments ?? []);
+    setAttachmentTarget(draft.attachmentTarget ?? getDefaultAttachmentTarget(selectedCommand ?? manifest.commands[0]));
+    setAttachmentMode(draft.attachmentMode ?? 'snippet');
+    setPreviewOverride(draft.previewOverride ?? null);
+    setDraftRestored(true);
+  }, []);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('command-generator-advanced', showAdvanced ? 'true' : 'false');
+    } catch {
+      // ignore
+    }
+  }, [showAdvanced]);
+
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      saveDraft({
+        selectedCommandId,
+        formState,
+        variables,
+        attachments,
+        attachmentTarget,
+        attachmentMode,
+        previewOverride,
+        savedAt: Date.now(),
+      });
+      setDraftSavedAt(Date.now());
+    }, 400);
+    return () => window.clearTimeout(handle);
+  }, [selectedCommandId, formState, variables, attachments, attachmentTarget, attachmentMode, previewOverride]);
+
   const startWorkflow = (workflowId: string) => {
+    const workflow = manifest.workflows.find((w) => w.id === workflowId);
+    if (!workflow) return;
     setActiveWorkflowId(workflowId);
     setWorkflowStepIndex(0);
     setWorkflowForms({});
@@ -354,6 +628,9 @@ export default function App() {
     setWorkflowStepStatus({});
     setWorkflowPreviewOverrides({});
     setWorkflowBindingsApplied({});
+    if (workflow.steps[0]?.commandId) {
+      setSelectedCommandId(workflow.steps[0].commandId);
+    }
     setTab('workflow-run');
   };
 
@@ -361,6 +638,80 @@ export default function App() {
     () => (activeWorkflowId ? manifest.workflows.find((w) => w.id === activeWorkflowId) ?? null : null),
     [activeWorkflowId],
   );
+  const guidanceContext = useMemo(
+    () => (activeWorkflow ? { workflowTemplate: activeWorkflow.title } : undefined),
+    [activeWorkflow],
+  );
+  const guardrailRecommendation = useMemo(() => recommendNext(guidanceState, guidanceContext), [guidanceState, guidanceContext]);
+  const intentFieldId = useMemo(
+    () => selectedCommand?.fields.find((f) => /INTENT/i.test(f.id))?.id ?? null,
+    [selectedCommand],
+  );
+  const contextFieldId = useMemo(
+    () => selectedCommand?.fields.find((f) => /CONTEXT/i.test(f.id))?.id ?? null,
+    [selectedCommand],
+  );
+  const constraintsFieldId = useMemo(
+    () => selectedCommand?.fields.find((f) => /CONSTRAINTS/i.test(f.id))?.id ?? null,
+    [selectedCommand],
+  );
+  const intentFeedback: QualityFeedback | null = useMemo(() => {
+    if (!intentFieldId) return null;
+    return evaluateIntent(String(formState[intentFieldId] ?? ''));
+  }, [intentFieldId, formState]);
+  const contextFeedback: QualityFeedback | null = useMemo(() => {
+    if (!contextFieldId) return null;
+    return evaluateContext(String(formState[contextFieldId] ?? ''));
+  }, [contextFieldId, formState]);
+  const constraintsFeedback: QualityFeedback | null = useMemo(() => {
+    if (!constraintsFieldId) return null;
+    return evaluateConstraints(String(formState[constraintsFieldId] ?? ''));
+  }, [constraintsFieldId, formState]);
+  const generatorSections = useMemo(() => {
+    if (!selectedCommand) return [];
+    const sections = [
+      { key: 'intent', title: 'Intent', match: (f: FieldDefinition) => /INTENT/i.test(f.id) },
+      { key: 'context', title: 'Context', match: (f: FieldDefinition) => /CONTEXT/i.test(f.id) },
+      { key: 'constraints', title: 'Constraints', match: (f: FieldDefinition) => /CONSTRAINTS/i.test(f.id) },
+      { key: 'depth', title: 'Depth', match: (f: FieldDefinition) => f.id === 'DEPTH' },
+      { key: 'export', title: 'Export path', match: (f: FieldDefinition) => f.type === 'path' },
+    ];
+    const used = new Set<string>();
+    const resolved = sections
+      .map((section) => {
+        const fields = selectedCommand.fields.filter((f) => section.match(f));
+        fields.forEach((f) => used.add(f.id));
+        return { ...section, fields };
+      })
+      .filter((section) => section.fields.length > 0);
+    const otherFields = selectedCommand.fields.filter((f) => !used.has(f.id));
+    if (otherFields.length > 0) {
+      resolved.push({ key: 'details', title: 'Details', fields: otherFields });
+    }
+    return resolved;
+  }, [selectedCommand]);
+  const basicSections = useMemo(
+    () => generatorSections.filter((section) => section.key === 'intent' || section.key === 'context'),
+    [generatorSections],
+  );
+  const advancedSections = useMemo(
+    () => generatorSections.filter((section) => section.key !== 'intent' && section.key !== 'context'),
+    [generatorSections],
+  );
+  const advancedRequiredFields = useMemo(
+    () => advancedSections.flatMap((section) => section.fields.filter((f) => f.required)),
+    [advancedSections],
+  );
+  const missingAdvancedRequired = useMemo(() => {
+    if (!selectedCommand) return [];
+    return advancedRequiredFields.filter((f) => !isFieldFilled(f.id, selectedCommand, formState[f.id]));
+  }, [advancedRequiredFields, formState, selectedCommand]);
+
+  useEffect(() => {
+    if (missingAdvancedRequired.length > 0) {
+      setShowAdvanced(true);
+    }
+  }, [missingAdvancedRequired.length]);
 
   const currentStep = activeWorkflow?.steps[workflowStepIndex];
   const workflowCommand = currentStep ? manifest.commands.find((c) => c.id === currentStep.commandId) ?? null : null;
@@ -482,6 +833,15 @@ export default function App() {
 
   const handleWorkflowGenerate = () => {
     if (!currentStep || !workflowCommand || !workflowFormState) return;
+    setUndoSnapshot({
+      selectedCommandId,
+      formState,
+      variables,
+      attachments,
+      attachmentTarget,
+      attachmentMode,
+      previewOverride,
+    });
     const entry: HistoryEntry = {
       id: `${workflowCommand.id}-${Date.now()}`,
       commandId: workflowCommand.id,
@@ -491,6 +851,10 @@ export default function App() {
     };
     const list = addHistory(entry);
     setHistory(list);
+    const nextGuidance = recordGuidanceSuccess(workflowCommand.id, workflowCommand.stage, entry.createdAt);
+    setGuidanceState(nextGuidance);
+    setNextRecommendation(recommendNext(nextGuidance, guidanceContext));
+    setShowNextCard(true);
     if (workflowCommand.outputs) {
       const next = { ...workflowVariables };
       workflowCommand.outputs.forEach((output) => {
@@ -599,6 +963,7 @@ export default function App() {
     if (!text) return;
     try {
       await navigator.clipboard.writeText(text);
+      showFeedback('Copied to clipboard.');
     } catch {
       const textarea = document.createElement('textarea');
       textarea.value = text;
@@ -608,8 +973,104 @@ export default function App() {
       textarea.select();
       document.execCommand('copy');
       document.body.removeChild(textarea);
+      showFeedback('Copied to clipboard.');
     }
   };
+
+  const renderField = (f: FieldDefinition) => (
+    <div key={f.id} className="field">
+      <label className="field-label">
+        {f.label}
+        {f.required && <span className="required">*</span>}
+      </label>
+      {f.type === 'select' ? (
+        <select value={String(formState[f.id] ?? '')} onChange={(e) => handleFieldChange(f.id, e.target.value)} className="input">
+          {(f.options ?? []).map((o) => (
+            <option key={o} value={o}>
+              {o}
+            </option>
+          ))}
+        </select>
+      ) : f.type === 'boolean' ? (
+        <input type="checkbox" checked={Boolean(formState[f.id])} onChange={(e) => handleFieldChange(f.id, e.target.checked)} />
+      ) : f.type === 'path' ? (
+        <div className="input-row">
+          <input
+            className="input"
+            value={(formState[f.id] as string) ?? ''}
+            placeholder="选择或输入路径"
+            onChange={(e) => handleFieldChange(f.id, e.target.value)}
+          />
+          <button
+            className="btn secondary"
+            type="button"
+            disabled={!supportsDirectoryPicker}
+            onClick={() => pickDirectory((value) => handleFieldChange(f.id, value))}
+          >
+            <Icon name="folder" /> 选文件夹
+          </button>
+        </div>
+      ) : f.type === 'list' ? (
+        <>
+          <textarea
+            className="input"
+            rows={3}
+            placeholder="每行一项"
+            value={(formState[f.id] as string[] | undefined)?.join('\n') ?? ''}
+            onChange={(e) => handleListChange(f.id, e.target.value)}
+          />
+          <button className="btn danger" type="button" onClick={() => clearFieldValue(f.id, f.type)}>
+            <Icon name="trash" /> 清空多行内容
+          </button>
+        </>
+      ) : (
+        <>
+          <textarea
+            className="input"
+            rows={f.type === 'text' ? 2 : 4}
+            value={(formState[f.id] as string) ?? ''}
+            onChange={(e) => handleFieldChange(f.id, e.target.value)}
+          />
+          {f.type === 'multiline' && (
+            <button className="btn danger" type="button" onClick={() => clearFieldValue(f.id, f.type)}>
+              <Icon name="trash" /> 清空多行内容
+            </button>
+          )}
+        </>
+      )}
+      {f.help && <div className="muted small">{f.help}</div>}
+    </div>
+  );
+
+  const checklistItems = useMemo(() => {
+    const items = [
+      { id: 'intent', label: 'Intent', sectionKey: 'intent' },
+      { id: 'context', label: 'Context', sectionKey: 'context' },
+      { id: 'constraints', label: 'Constraints', sectionKey: 'constraints' },
+      { id: 'paths', label: 'Paths', sectionKey: 'export' },
+    ];
+    if (!selectedCommand) {
+      return items.map((item) => ({
+        ...item,
+        hasFields: false,
+        complete: false,
+        sectionId: undefined as string | undefined,
+      }));
+    }
+    const sectionMap = new Map(generatorSections.map((section) => [section.key, section]));
+    return items.map((item) => {
+      const section = sectionMap.get(item.sectionKey);
+      const fields = section?.fields ?? [];
+      const hasFields = fields.length > 0;
+      const complete = !hasFields || fields.every((f) => isFieldFilled(f.id, selectedCommand, formState[f.id]));
+      return {
+        ...item,
+        hasFields,
+        complete,
+        sectionId: hasFields ? `section-${item.sectionKey}` : undefined,
+      };
+    });
+  }, [formState, generatorSections, selectedCommand]);
 
   return (
     <div className="app">
@@ -618,15 +1079,19 @@ export default function App() {
         <div className="tabs">
           <button className={tab === 'scenes' ? 'tab active' : 'tab'} onClick={() => setTab('scenes')}>
             <Icon name="scenes" />
-            场景
+            Start from a scenario
           </button>
           <button className={tab === 'commands' ? 'tab active' : 'tab'} onClick={() => setTab('commands')}>
             <Icon name="commands" />
-            命令
+            Build manually
           </button>
-          <button className={tab === 'generator' ? 'tab active' : 'tab'} onClick={() => setTab('generator')}>
+          <button
+            className={tab === 'generator' ? 'tab active' : 'tab'}
+            onClick={() => (canAccessGenerator ? setTab('generator') : null)}
+            disabled={!canAccessGenerator}
+          >
             <Icon name="generator" />
-            生成
+            Execution workspace (not a starting point)
           </button>
           <button className={tab === 'workflows' ? 'tab active' : 'tab'} onClick={() => setTab('workflows')}>
             <Icon name="workflows" />
@@ -664,8 +1129,9 @@ export default function App() {
 
       {tab === 'commands' && (
         <div className="layout">
+          <StageProgressBar status={guidanceState.stageStatus} />
           {Object.entries(groupedCommands).map(([stage, cmds]) => (
-            <section key={stage}>
+            <section key={stage} className="section-shell">
               <h3 className="section-title">
                 <Icon name="commands" />
                 {stageLabels[stage] ?? stage}（{cmds.length}）
@@ -675,10 +1141,21 @@ export default function App() {
                   <div key={c.id} className="card">
                     <div className="card-title">
                       {c.displayName}{' '}
-                      <span className={`pill constraint ${c.constraintLevel}`}>{constraintLabel[c.constraintLevel]}</span>
+                      <span
+                        className={`badge ${
+                          c.constraintLevel === 'strong'
+                            ? 'rigor-strict'
+                            : c.constraintLevel === 'medium'
+                              ? 'rigor-standard'
+                              : 'rigor-lite'
+                        }`}
+                      >
+                        {constraintLabel[c.constraintLevel]}
+                      </span>
+                      {c.constraintLevel === 'strong' && <span className="badge severity-high">高风险</span>}
                     </div>
                     <div className="card-sub">{c.description}</div>
-                    <button className="btn" onClick={() => setCommandAndSwitch(c.id)}>
+                    <button className="btn secondary" onClick={() => setCommandAndSwitch(c.id)}>
                       生成
                     </button>
                   </div>
@@ -690,199 +1167,286 @@ export default function App() {
       )}
 
       {tab === 'generator' && selectedCommand && (
-        <div className="layout columns">
-          <section className="column">
-            <h3>命令</h3>
-            <select value={selectedCommand.id} onChange={(e) => setSelectedCommandId(e.target.value)} className="select">
-              {sortedCommands.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.displayName} ({stageLabels[c.stage]})
-                </option>
-              ))}
-            </select>
+        <div className="layout generator-layout">
+          <div className="generator-guidance">
+            <StageProgressBar status={guidanceState.stageStatus} />
+            <GuardrailBanner
+              visible={guardrailVisible}
+              onContinue={() => setGuardrailVisible(false)}
+              onSwitch={() => {
+                setGuardrailVisible(false);
+                if (guardrailRecommendation?.command) {
+                  selectCommandWithGuardrail(guardrailRecommendation.command, true);
+                }
+              }}
+            />
+          </div>
+          <section className="generator-inputs">
+            <div className="panel-stack">
+              {feedbackMessage && <div className="success-notice">{feedbackMessage}</div>}
+              {draftRestored && <div className="draft-notice">已恢复上次草稿</div>}
+              {workflowSuggestion && <div className="suggestion-notice">{workflowSuggestion}</div>}
+              <div className="panel-card">
+                <div className="panel-title">Command</div>
+                <div className="command-title">{selectedCommand.displayName}</div>
+                <div className="required-checklist">
+                  <div className="panel-title">Required Checklist</div>
+                  <div className="checklist-items">
+                    {checklistItems.map((item) => {
+                      const content = (
+                        <>
+                          <span className={`checklist-dot ${item.complete ? 'done' : 'todo'}`} />
+                          <span className="checklist-label">{item.label}</span>
+                          <span className={`checklist-status ${item.complete ? 'done' : 'todo'}`}>
+                            {item.complete ? 'Complete' : 'Missing'}
+                          </span>
+                        </>
+                      );
+                      if (item.sectionId) {
+                        return (
+                          <a key={item.id} className={`checklist-item ${item.complete ? 'done' : ''}`} href={`#${item.sectionId}`}>
+                            {content}
+                          </a>
+                        );
+                      }
+                      return (
+                        <div key={item.id} className={`checklist-item disabled ${item.complete ? 'done' : ''}`}>
+                          {content}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+                <select value={selectedCommand.id} onChange={(e) => selectCommandWithGuardrail(e.target.value)} className="select">
+                  {sortedCommands.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.displayName} ({stageLabels[c.stage]})
+                    </option>
+                  ))}
+                </select>
+              </div>
 
-            <h3 style={{ marginTop: 12 }}>附件</h3>
-            <input type="file" multiple onChange={(e) => handleFileUpload(e.target.files)} />
-            <div className="muted small">仅路径/片段/全文插入；片段默认前 2000 字符。</div>
-            <div className="inline-actions">
-              <select value={attachmentTarget} onChange={(e) => setAttachmentTarget(e.target.value)} className="select">
-                {attachableFields.map((f) => (
-                  <option key={f.id} value={f.id}>
-                    插入到：{f.label}
-                  </option>
-                ))}
-              </select>
-              <select value={attachmentMode} onChange={(e) => setAttachmentMode(e.target.value as 'path' | 'snippet' | 'full')} className="select">
-                <option value="path">仅路径</option>
-                <option value="snippet">片段</option>
-                <option value="full">全文</option>
-              </select>
-            </div>
-            <div className="attachment-list">
-              {attachments.map((a) => (
-                <button key={a.name} className="pill" onClick={() => removeAttachment(a.name)}>
-                  {a.name} ×
-                </button>
-              ))}
-            </div>
-            {attachments.length > 0 && (
-              <button className="btn ghost" onClick={() => insertAttachmentsToField(attachmentTarget, attachmentMode)}>
-                插入到字段
-              </button>
-            )}
-          </section>
-
-          <section className="column">
-            <h3>字段</h3>
-            <div className="form">
-              {selectedCommand.fields.map((f) => (
-                <div key={f.id} className="field">
-                  <label>
-                    {f.label}
-                    {f.required && <span className="required">*</span>}
-                  </label>
-                  {f.type === 'select' ? (
-                    <select value={String(formState[f.id] ?? '')} onChange={(e) => handleFieldChange(f.id, e.target.value)} className="input">
-                      {(f.options ?? []).map((o) => (
-                        <option key={o} value={o}>
-                          {o}
-                        </option>
-                      ))}
-                    </select>
-                  ) : f.type === 'boolean' ? (
-                    <input type="checkbox" checked={Boolean(formState[f.id])} onChange={(e) => handleFieldChange(f.id, e.target.checked)} />
-                  ) : f.type === 'path' ? (
-                    <div className="input-row">
-                      <input
-                        className="input"
-                        value={(formState[f.id] as string) ?? ''}
-                        placeholder="选择或输入路径"
-                        onChange={(e) => handleFieldChange(f.id, e.target.value)}
-                      />
-                      <button
-                        className="btn ghost"
-                        type="button"
-                        disabled={!supportsDirectoryPicker}
-                        onClick={() => pickDirectory((value) => handleFieldChange(f.id, value))}
-                      >
-                        <Icon name="folder" /> 选文件夹
-                      </button>
-                    </div>
-                  ) : f.type === 'list' ? (
-                    <>
-                      <textarea
-                        className="input"
-                        rows={3}
-                        placeholder="每行一项"
-                        value={(formState[f.id] as string[] | undefined)?.join('\n') ?? ''}
-                        onChange={(e) => handleListChange(f.id, e.target.value)}
-                      />
-                      <button className="btn subtle" type="button" onClick={() => clearFieldValue(f.id, f.type)}>
-                        <Icon name="trash" /> 清空多行内容
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <textarea
-                        className="input"
-                        rows={f.type === 'text' ? 2 : 4}
-                        value={(formState[f.id] as string) ?? ''}
-                        onChange={(e) => handleFieldChange(f.id, e.target.value)}
-                      />
-                      {f.type === 'multiline' && (
-                        <button className="btn subtle" type="button" onClick={() => clearFieldValue(f.id, f.type)}>
-                          <Icon name="trash" /> 清空多行内容
-                        </button>
-                      )}
-                    </>
+              {basicSections.map((section) => (
+                <div key={section.key} id={`section-${section.key}`} className="panel-card">
+                  <div className="panel-title">{section.title}</div>
+                  <div className="form">{section.fields.map((f) => renderField(f))}</div>
+                  {section.key === 'intent' && intentFeedback && (
+                    <div className={`quality-feedback ${intentFeedback.status}`}>{intentFeedback.message}</div>
                   )}
-                  {f.help && <div className="muted small">{f.help}</div>}
+                  {section.key === 'context' && contextFeedback && (
+                    <div className={`quality-feedback ${contextFeedback.status}`}>{contextFeedback.message}</div>
+                  )}
                 </div>
               ))}
-            </div>
-            <div className="inline-actions" style={{ marginTop: 8 }}>
-              <button className="btn primary" disabled={!canGenerate} onClick={handleAddHistory}>
-                生成并保存
-              </button>
-              <button className="btn" disabled={!canGenerate} onClick={() => copyText(previewText)}>
-                复制命令
-              </button>
-              {previewOverride !== null && (
-                <button className="btn ghost" onClick={() => setPreviewOverride(null)}>
-                  重置预览
+
+              <div className="advanced-toggle">
+                <button
+                  className={`section-toggle ${advancedRequiredFields.length === 0 ? 'is-muted' : ''}`}
+                  type="button"
+                  onClick={() => setShowAdvanced((prev) => !prev)}
+                >
+                  {showAdvanced
+                    ? `Hide advanced options · ${advancedRequiredFields.length} required`
+                    : `Advanced options · ${advancedRequiredFields.length} required`}
                 </button>
+              </div>
+
+              <div className={`advanced-panel ${showAdvanced ? 'open' : ''} ${missingAdvancedRequired.length > 0 ? 'needs-attention' : ''}`}>
+                <div className="advanced-inner">
+                  {advancedSections.map((section) => (
+                    <div key={section.key} id={`section-${section.key}`} className="panel-card">
+                      <div className="panel-title">{section.title}</div>
+                      <div className="form">{section.fields.map((f) => renderField(f))}</div>
+                      {section.key === 'constraints' && constraintsFeedback && (
+                        <div className={`quality-feedback ${constraintsFeedback.status}`}>{constraintsFeedback.message}</div>
+                      )}
+                    </div>
+                  ))}
+
+                  <div className="panel-card">
+                    <div className="panel-title">Attachments</div>
+                    <label className="btn secondary file-picker">
+                      选择文件
+                      <input type="file" multiple className="file-input" onChange={(e) => handleFileUpload(e.target.files)} />
+                    </label>
+                    <div className="muted small">仅路径/片段/全文插入；片段默认前 2000 字符。</div>
+                    <div className="inline-actions">
+                      <select value={attachmentTarget} onChange={(e) => setAttachmentTarget(e.target.value)} className="select">
+                        {attachableFields.map((f) => (
+                          <option key={f.id} value={f.id}>
+                            插入到：{f.label}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        value={attachmentMode}
+                        onChange={(e) => setAttachmentMode(e.target.value as 'path' | 'snippet' | 'full')}
+                        className="select"
+                      >
+                        <option value="path">仅路径</option>
+                        <option value="snippet">片段</option>
+                        <option value="full">全文</option>
+                      </select>
+                    </div>
+                    <div className="attachment-list">
+                      {attachments.map((a) => (
+                        <button key={a.name} className="pill" onClick={() => removeAttachment(a.name)}>
+                          {a.name} ×
+                        </button>
+                      ))}
+                    </div>
+                    {attachments.length > 0 && (
+                    <button className="btn tertiary" onClick={() => insertAttachmentsToField(attachmentTarget, attachmentMode)}>
+                      插入到字段
+                    </button>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {showNextCard && nextRecommendation && (
+                <NextStepCard
+                  recommendation={nextRecommendation}
+                  onUse={() => {
+                    setShowNextCard(false);
+                    selectCommandWithGuardrail(nextRecommendation.command, true);
+                  }}
+                  onBrowse={() => {
+                    setShowNextCard(false);
+                    setTab('commands');
+                  }}
+                />
               )}
+
+              <div className="panel-card">
+                <div className="panel-title">Variables</div>
+                <div className="inline-actions">
+                  <input
+                    className="input"
+                    placeholder="变量名（如 plan_output_path）"
+                    value={newVarKey}
+                    onChange={(e) => setNewVarKey(e.target.value)}
+                  />
+                  <input className="input" placeholder="变量值" value={newVarValue} onChange={(e) => setNewVarValue(e.target.value)} />
+                  <button className="btn secondary" onClick={addVariable}>
+                    添加变量
+                  </button>
+                </div>
+                {Object.keys(variables).length > 0 && (
+                  <div className="muted small">当前变量：{Object.entries(variables).map(([k, v]) => `${k}=${v}`).join(' | ')}</div>
+                )}
+              </div>
             </div>
-            {missingRequired.length > 0 && (
-              <div className="muted small">缺少必填字段：{missingRequired.map((f) => f.label).join('、')}</div>
-            )}
-            {missingVars.length > 0 && <div className="muted small">缺少变量：{missingVars.join(', ')}</div>}
-            <div className="divider" />
-            <div className="inline-actions">
-              <input
-                className="input"
-                placeholder="变量名（如 plan_output_path）"
-                value={newVarKey}
-                onChange={(e) => setNewVarKey(e.target.value)}
-              />
-              <input className="input" placeholder="变量值" value={newVarValue} onChange={(e) => setNewVarValue(e.target.value)} />
-              <button className="btn ghost" onClick={addVariable}>
-                添加变量
-              </button>
+            <div className="panel-card actions-panel">
+              <div className="panel-title actions-kicker">Next step</div>
+              <div className="actions-title">Generate &amp; Save</div>
+              <div className="actions-subtitle">Create the final command output, then copy or export it.</div>
+              <div className="inline-actions">
+                <button className="btn primary" disabled={!canGenerate} onClick={handleAddHistory}>
+                  生成并保存
+                </button>
+                <button className="btn secondary" disabled={!canGenerate} onClick={() => copyText(previewText)}>
+                  复制命令
+                </button>
+                <button className="btn secondary" onClick={() => handleSingleExport('md', supportsSave ? 'save' : 'download')}>
+                  <Icon name="export" /> 保存 .md
+                </button>
+                <button className="btn ghost" onClick={() => handleSingleExport('txt', 'download')}>
+                  <Icon name="download" /> 下载 .txt
+                </button>
+                <button className="btn ghost" onClick={() => handleSingleExport('json', 'download')}>
+                  <Icon name="download" /> 下载 .json
+                </button>
+                {supportsShare && (
+                  <button className="btn ghost" onClick={() => handleSingleExport('txt', 'share')}>
+                    <Icon name="share" /> 分享
+                  </button>
+                )}
+              </div>
+              {missingRequired.length > 0 && (
+                <div className="muted small">缺少必填字段：{missingRequired.map((f) => f.label).join('、')}</div>
+              )}
+              {missingVars.length > 0 && <div className="muted small">缺少变量：{missingVars.join(', ')}</div>}
+              {draftSavedAt && <div className="muted small">Draft autosaved to local storage at {formatDate(draftSavedAt)}.</div>}
             </div>
-            {Object.keys(variables).length > 0 && (
-              <div className="muted small">当前变量：{Object.entries(variables).map(([k, v]) => `${k}=${v}`).join(' | ')}</div>
-            )}
           </section>
 
-          <section className="column">
-            <h3>预览</h3>
-            <textarea
-              className="preview"
-              value={previewText}
-              onChange={(e) => setPreviewOverride(e.target.value)}
-              placeholder="可直接编辑预览内容（不回写表单）"
-            />
-            <div className="inline-actions">
-              <button className="btn" onClick={() => handleSingleExport('md', supportsSave ? 'save' : 'download')}>
-                <Icon name="export" /> 保存 .md
-              </button>
-              <button className="btn ghost" onClick={() => handleSingleExport('txt', 'download')}>
-                <Icon name="download" /> 下载 .txt
-              </button>
-              <button className="btn ghost" onClick={() => handleSingleExport('json', 'download')}>
-                <Icon name="download" /> 下载 .json
-              </button>
-              {supportsShare && (
-                <button className="btn" onClick={() => handleSingleExport('txt', 'share')}>
-                  <Icon name="share" /> 分享
-                </button>
-              )}
+          <section className="generator-preview">
+            <div className="preview-panel">
+              <div className="preview-header">
+                <h3>预览</h3>
+                <div className="preview-toolbar">
+                  <button className="btn ghost" onClick={restoreUndoSnapshot} disabled={!undoSnapshot}>
+                    撤销
+                  </button>
+                  {previewOverride !== null && (
+                    <button className="btn ghost" onClick={() => setPreviewOverride(null)}>
+                      重置预览
+                    </button>
+                  )}
+                </div>
+              </div>
+              <div className="preview-surface">
+                <div className="muted small preview-note">Edits here affect output only and do not update input fields.</div>
+                <textarea
+                  className="preview"
+                  value={previewText}
+                  onChange={(e) => setPreviewOverride(e.target.value)}
+                  placeholder="可直接编辑预览内容（不回写表单）"
+                />
+              </div>
+              <div className="muted small">缺失变量将显示为 &lt;&lt;MISSING:var&gt;&gt; ，必填字段缺失会阻断“生成并保存”。</div>
             </div>
-            <div className="muted small">缺失变量将显示为 &lt;&lt;MISSING:var&gt;&gt; ，必填字段缺失会阻断“生成并保存”。</div>
           </section>
         </div>
       )}
       {tab === 'workflows' && (
         <div className="layout">
+          <StageProgressBar status={guidanceState.stageStatus} />
           <section>
             <h3>工作流模板</h3>
             <div className="card-grid">
-              {manifest.workflows.map((w) => (
-                <div key={w.id} className="card">
-                  <div className="card-title">{w.title}</div>
-                  <div className="card-sub">
+              {manifest.workflows.map((w) => {
+                const optionalStages = Array.from(
+                  new Set(
+                    w.steps
+                      .filter((s) => s.optional)
+                      .map((s) => commandStageMap[s.commandId])
+                      .filter(Boolean),
+                  ),
+                )
+                  .sort((a, b) => stageFlow.indexOf(a) - stageFlow.indexOf(b))
+                  .map((stage) => stageLabelMap[stage] ?? stage);
+                return (
+                  <div key={w.id} className="card">
+                    <div className="card-title">{w.title}</div>
+                    <div className="workflow-meta">
+                      {w.intendedScenario && <div className="workflow-meta-row">Intended scenario: {w.intendedScenario}</div>}
+                      {w.audience && <div className="workflow-meta-row">For: {w.audience === 'new user' ? 'New user' : 'Power user'}</div>}
+                      <div className="workflow-meta-row">
+                        Optional stages: {optionalStages.length > 0 ? optionalStages.join(', ') : 'None'}
+                      </div>
+                    </div>
+                  <div className="workflow-steps">
                     {w.steps.map((s, idx) => (
-                      <div key={s.stepId}>
-                        {idx + 1}. {s.commandId} {s.optional ? '(可选)' : ''}
+                      <div key={s.stepId} className={`workflow-step ${idx === 0 ? 'is-first' : ''}`}>
+                        <div className="workflow-step-title">
+                          {idx + 1}. {s.commandId}
+                        </div>
+                        <div className="workflow-step-meta">
+                          <span>步骤 {idx + 1}</span>
+                    {idx === 0 && <span className="badge status-current">当前</span>}
+                    {s.optional && <span className="badge optional">可选</span>}
+                        </div>
                       </div>
                     ))}
                   </div>
-                  <button className="btn" onClick={() => startWorkflow(w.id)}>
-                    从第 1 步开始
-                  </button>
-                </div>
-              ))}
+                <button className="btn secondary" onClick={() => startWorkflow(w.id)}>
+                  从第 1 步开始
+                </button>
+                  </div>
+                );
+              })}
             </div>
           </section>
         </div>
@@ -928,7 +1492,7 @@ export default function App() {
             <div className="inline-actions">
               <input className="input" placeholder="变量名" value={workflowVarKey} onChange={(e) => setWorkflowVarKey(e.target.value)} />
               <input className="input" placeholder="变量值" value={workflowVarValue} onChange={(e) => setWorkflowVarValue(e.target.value)} />
-              <button className="btn ghost" onClick={addWorkflowVariable}>
+              <button className="btn secondary" onClick={addWorkflowVariable}>
                 添加
               </button>
             </div>
@@ -982,7 +1546,7 @@ export default function App() {
                         value={(workflowFormState[f.id] as string[] | undefined)?.join('\n') ?? ''}
                         onChange={(e) => updateWorkflowList(f.id, e.target.value)}
                       />
-                      <button className="btn subtle" type="button" onClick={() => clearWorkflowFieldValue(f.id, f.type)}>
+                      <button className="btn danger" type="button" onClick={() => clearWorkflowFieldValue(f.id, f.type)}>
                         <Icon name="trash" /> 清空多行内容
                       </button>
                     </>
@@ -995,7 +1559,7 @@ export default function App() {
                         onChange={(e) => updateWorkflowField(f.id, e.target.value)}
                       />
                       {f.type === 'multiline' && (
-                        <button className="btn subtle" type="button" onClick={() => clearWorkflowFieldValue(f.id, f.type)}>
+                        <button className="btn danger" type="button" onClick={() => clearWorkflowFieldValue(f.id, f.type)}>
                           <Icon name="trash" /> 清空多行内容
                         </button>
                       )}
@@ -1008,10 +1572,10 @@ export default function App() {
               <button className="btn primary" disabled={!canGenerateWorkflowStep} onClick={handleWorkflowGenerate}>
                 生成并保存
               </button>
-              <button className="btn ghost" onClick={applyBindingsForStep}>
+              <button className="btn tertiary" onClick={applyBindingsForStep}>
                 应用变量绑定
               </button>
-              <button className="btn" onClick={handleWorkflowSkip}>
+              <button className="btn tertiary" onClick={handleWorkflowSkip}>
                 跳过此步
               </button>
             </div>
@@ -1021,7 +1585,10 @@ export default function App() {
             {workflowMissingVars.length > 0 && <div className="muted small">缺少变量：{workflowMissingVars.join(', ')}</div>}
             <div className="divider" />
             <h3>附件</h3>
-            <input type="file" multiple onChange={(e) => handleWorkflowFileUpload(e.target.files)} />
+            <label className="btn secondary file-picker">
+              选择文件
+              <input type="file" multiple className="file-input" onChange={(e) => handleWorkflowFileUpload(e.target.files)} />
+            </label>
             <div className="inline-actions">
               <select value={workflowAttachmentTarget} onChange={(e) => setWorkflowAttachmentTarget(e.target.value)} className="select">
                 {workflowCommand.fields
@@ -1050,7 +1617,7 @@ export default function App() {
               ))}
             </div>
             {workflowAttachmentsList.length > 0 && (
-              <button className="btn ghost" onClick={() => insertWorkflowAttachments(workflowAttachmentTarget, workflowAttachmentMode)}>
+              <button className="btn tertiary" onClick={() => insertWorkflowAttachments(workflowAttachmentTarget, workflowAttachmentMode)}>
                 插入到字段
               </button>
             )}
@@ -1065,14 +1632,14 @@ export default function App() {
               placeholder="可直接编辑预览内容（不回写表单）"
             />
             <div className="inline-actions">
-              <button className="btn" onClick={() => handleWorkflowExport('md', supportsSave ? 'save' : 'download')}>
+              <button className="btn secondary" onClick={() => handleWorkflowExport('md', supportsSave ? 'save' : 'download')}>
                 <Icon name="export" /> 保存 .md
               </button>
               <button className="btn ghost" onClick={() => handleWorkflowExport('txt', 'download')}>
                 <Icon name="download" /> 下载 .txt
               </button>
               {supportsShare && (
-                <button className="btn" onClick={() => handleWorkflowExport('txt', 'share')}>
+                <button className="btn ghost" onClick={() => handleWorkflowExport('txt', 'share')}>
                   <Icon name="share" /> 分享
                 </button>
               )}
@@ -1087,7 +1654,7 @@ export default function App() {
             <div className="card-grid">
               {history.length === 0 && <div className="muted">暂无历史</div>}
               {history.map((h) => (
-                <div key={h.id} className="card">
+                <div key={h.id} className="card history-card">
                   <div className="card-title">
                     {h.commandId} <span className="card-sub">{formatDate(h.createdAt)}</span>
                   </div>
@@ -1095,21 +1662,20 @@ export default function App() {
                     {h.commandText.slice(0, 200)}
                     {h.commandText.length > 200 ? '...' : ''}
                   </pre>
-                  <div className="inline-actions">
-                    <button className="btn" onClick={() => copyText(h.commandText)}>
+                  <div className="inline-actions history-actions">
+                    <button className="btn secondary" onClick={() => copyText(h.commandText)}>
                       复制
                     </button>
                     <button
                       className="btn ghost"
                       onClick={() => {
                         setFormDraft(h.fields);
-                        setSelectedCommandId(h.commandId);
-                        setTab('generator');
+                        selectCommandWithGuardrail(h.commandId, true);
                       }}
                     >
                       复用
                     </button>
-                    <button className="btn ghost" onClick={() => removeHistoryItem(h.id)}>
+                    <button className="btn danger" onClick={() => removeHistoryItem(h.id)}>
                       删除
                     </button>
                   </div>

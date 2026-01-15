@@ -254,6 +254,8 @@ LIMITATIONS:
   workflows: [
     {
       id: 'workflow-a',
+      intendedScenario: 'New feature delivery with unclear requirements',
+      audience: 'new user',
       title: '新需求开发（需求不清晰）',
       steps: [
         { stepId: 'wfa1', commandId: 'senior-explore' },
@@ -266,6 +268,8 @@ LIMITATIONS:
     },
     {
       id: 'workflow-b',
+      intendedScenario: 'Production incident diagnosis and fix',
+      audience: 'power user',
       title: '生产问题修复',
       steps: [
         { stepId: 'wfb1', commandId: 'senior-explore' },
@@ -277,6 +281,8 @@ LIMITATIONS:
     },
     {
       id: 'workflow-c',
+      intendedScenario: 'Pull request review with escalating rigor',
+      audience: 'new user',
       title: 'PR 代码评审',
       steps: [
         { stepId: 'wfc1', commandId: 'review-lite', optional: true },
@@ -286,6 +292,8 @@ LIMITATIONS:
     },
     {
       id: 'workflow-d',
+      intendedScenario: 'Java backend planning to delivery',
+      audience: 'power user',
       title: 'Java 后端端到端',
       steps: [
         { stepId: 'wfd1', commandId: 'senior-explore' },

@@ -1,4 +1,6 @@
 export type FieldType = 'text' | 'multiline' | 'select' | 'boolean' | 'path' | 'list';
+export type StageKey = 'explore' | 'plan' | 'review' | 'implement' | 'finalize';
+export type StageStatus = 'todo' | 'active' | 'done';
 
 export interface FieldDefinition {
   id: string;
@@ -20,7 +22,7 @@ export interface OutputDefinition {
 export interface CommandDefinition {
   id: string;
   displayName: string;
-  stage: 'explore' | 'plan' | 'review' | 'implement' | 'finalize';
+  stage: StageKey;
   constraintLevel: 'strong' | 'medium' | 'weak';
   description: string;
   fields: FieldDefinition[];
@@ -39,6 +41,8 @@ export interface WorkflowDefinition {
   id: string;
   title: string;
   description?: string;
+  intendedScenario?: string;
+  audience?: 'new user' | 'power user';
   steps: WorkflowStep[];
 }
 
@@ -72,4 +76,27 @@ export interface HistoryEntry {
 export interface Attachment {
   name: string;
   content: string;
+}
+
+export interface GuidanceHistoryEntry {
+  command: string;
+  stage: StageKey;
+  ts: number;
+}
+
+export interface GuidanceState {
+  stageStatus: Record<StageKey, StageStatus>;
+  history: GuidanceHistoryEntry[];
+  last: GuidanceHistoryEntry | null;
+}
+
+export interface GuidanceContext {
+  workflowTemplate?: string;
+}
+
+export interface GuidanceRecommendation {
+  stage: StageKey;
+  command: string;
+  reason: string;
+  severity?: 'warning';
 }
